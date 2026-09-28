@@ -379,11 +379,11 @@ body {
 
     border-radius: 50%;
 
-    background: var(--selected-beacon-color, var(--cyan));
+    background: var(--cyan);
 
     box-shadow:
-        0 0 12px var(--selected-beacon-color, var(--cyan)),
-        0 0 30px var(--selected-beacon-color, var(--cyan));
+        0 0 12px var(--cyan),
+        0 0 30px rgba(53, 216, 255, 0.6);
 }
 
 .terminal-data {
@@ -484,8 +484,7 @@ body {
         0 0 20px rgba(53, 216, 255, 0.22);
 }
 
-#pattern-select,
-#tracking-beacon-select {
+#pattern-select {
     width: 100%;
     height: 42px;
 
