@@ -222,13 +222,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         # Dashboard is now a child widget, not a top-level window, so its own
-        # closeEvent() never fires automatically - close its logger ourselves.
-        logger = getattr(self.dashboard, "logger", None)
-        if logger is not None:
-            try:
-                logger.close()
-            except Exception:
-                pass
+        # closeEvent() never fires automatically - shut it down ourselves
+        # (saves the final performance report and closes the CSV logger).
+        try:
+            self.dashboard.shutdown()
+        except Exception:
+            pass
         if hasattr(self, "web_server"):
             self.web_server.shutdown()
             self.web_server.server_close()

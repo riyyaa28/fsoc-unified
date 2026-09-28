@@ -20,8 +20,8 @@ from PyQt5.QtWidgets import (
     QFrame,
 )
 
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QImage, QPixmap, QDesktopServices
+from PyQt5.QtCore import QTimer, Qt, QUrl
 
 from sim.scene import VirtualScene
 from sim.virtual_camera import VirtualPTZCamera
@@ -38,6 +38,15 @@ from control.ptz_controller import compute_delta
 from vision.kalman_tracker import BeaconKalmanTracker
 from disturbance.manager import DisturbanceManager
 from logging_.logger import PerformanceLogger
+from logging_.metrics import (
+    RunMetrics,
+    STATE_LOCKED,
+    STATE_PREDICTING,
+    STATE_SEEKING,
+)
+from logging_.report import write_report
+
+REPORTS_DIR = "reports"
 
 
 class Dashboard(QWidget):
@@ -97,6 +106,11 @@ class Dashboard(QWidget):
 
         # Performance logging
         self.logger = PerformanceLogger()
+
+        # Per-run metrics for the performance report. A report is written
+        # on GENERATE REPORT, and automatically on RESET and on exit.
+        self.metrics = RunMetrics()
+        self.reported_frame_count = 0
 
         self.frame_count = 0
         self.tracking_elapsed = 0.0
@@ -463,6 +477,12 @@ class Dashboard(QWidget):
 
         self.hide_button = QPushButton("HIDE BEACON")
 
+        self.report_button = QPushButton("GENERATE REPORT")
+        self.report_button.setToolTip(
+            "Write a performance report for the current run to the "
+            f"'{REPORTS_DIR}' folder and open it"
+        )
+
         self.start_button.clicked.connect(self._start_simulation)
 
         self.pause_button.clicked.connect(self._pause_simulation)
@@ -471,6 +491,10 @@ class Dashboard(QWidget):
 
         self.hide_button.clicked.connect(self._toggle_beacon_visibility)
 
+        self.report_button.clicked.connect(
+            lambda: self._generate_report(open_after=True)
+        )
+
         row.addWidget(self.start_button)
 
         row.addWidget(self.pause_button)
@@ -478,6 +502,8 @@ class Dashboard(QWidget):
         row.addWidget(self.reset_button)
 
         row.addWidget(self.hide_button)
+
+        row.addWidget(self.report_button)
 
         row.addSpacing(12)
 
@@ -526,12 +552,14 @@ class Dashboard(QWidget):
     def _start_simulation(self):
         if not self.running:
             self.running = True
+            self.metrics.pause()
             self.timer.start()
             self.system_status.setText("● SYSTEM ONLINE   |   SIMULATION RUNNING")
 
     def _pause_simulation(self):
         self.running = False
         self.timer.stop()
+        self.metrics.pause()
         self.system_status.setText("● SYSTEM PAUSED   |   PRESS START TO RESUME")
 
     def _relocate_rendered_beacon(self, frame, old_pos, new_pos):
@@ -620,6 +648,10 @@ class Dashboard(QWidget):
     def _reset_simulation(self):
         self.running = False
         self.timer.stop()
+        # Keep the finished run's results before its metrics are cleared.
+        auto_report = self._generate_report(open_after=False, only_if_new=True)
+        self.metrics = RunMetrics()
+        self.reported_frame_count = 0
         self.beacon_hidden = False
         self.hide_button.setText("HIDE BEACON")
         self.kalman_prediction_world = None
@@ -677,7 +709,49 @@ class Dashboard(QWidget):
         self._render_reset_frame()
         self.system_status.setText(
             "● SYSTEM READY   |   SIMULATION RESET   |   PRESS START"
+            + (f"   |   REPORT SAVED: {auto_report}" if auto_report else "")
         )
+
+    # ==============================================================
+    # PERFORMANCE REPORT
+    # ==============================================================
+
+    def _report_config(self):
+        return {
+            "Scene size": f"{self.scene.width} x {self.scene.height} px",
+            "Camera field of view": (
+                f"{self.camera.fov_w} x {self.camera.fov_h} px"
+            ),
+            "Motion pattern setting": self.pattern_combo.currentText(),
+            "Decoy beacons": self.decoy_slider.value(),
+            "Detection": "YOLO (beacon_yolo.pt) + classical ring detector, fused",
+            "Tracking": "Constant-velocity Kalman filter (world frame)",
+            "Loop timer interval": f"{self.timer.interval()} ms",
+        }
+
+    def _generate_report(self, open_after=False, only_if_new=False):
+        """Write the report; returns its path, or None if nothing was written."""
+        frame_count = len(self.metrics)
+        if only_if_new and frame_count <= self.reported_frame_count:
+            return None
+        try:
+            path = write_report(self.metrics, self._report_config(), REPORTS_DIR)
+        except Exception as exc:
+            self.system_status.setText(f"● REPORT FAILED   |   {exc}")
+            return None
+        self.reported_frame_count = frame_count
+        self.system_status.setText(f"● REPORT SAVED   |   {path}")
+        if open_after:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        return path
+
+    def shutdown(self):
+        """Stop the loop, save a final report for an unreported run and
+        close the CSV logger. Called when the application exits."""
+        self.running = False
+        self.timer.stop()
+        self._generate_report(open_after=False, only_if_new=True)
+        self.logger.close()
 
     def _render_reset_frame(self):
         full_frame, true_pos = self.scene.render()
@@ -1019,6 +1093,8 @@ class Dashboard(QWidget):
         if not self.running:
             return
 
+        self.metrics.begin_frame()
+
         full_frame, raw_true_pos = self.scene.render()
         true_pos = (float(raw_true_pos[0]), float(raw_true_pos[1]))
 
@@ -1064,6 +1140,14 @@ class Dashboard(QWidget):
             and 0 <= true_local[1] < self.camera.fov_h
         )
         self.target_visible_in_fov = target_visible
+        # Ground-truth pointing error: true beacon centroid vs. boresight
+        # (image centre) in the frame the detector is about to see.
+        true_local_x = float(true_pos[0]) - float(crop_x0)
+        true_local_y = float(true_pos[1]) - float(crop_y0)
+        truth_error = math.hypot(
+            true_local_x - self.screen_center[0],
+            true_local_y - self.screen_center[1],
+        )
         self.last_known_world_pos = (float(true_pos[0]), float(true_pos[1]))
         yolo_pos = None
         yolo_score = 0.0
@@ -1281,6 +1365,17 @@ class Dashboard(QWidget):
             world_dy = (float(true_pos[1]) - self.camera.tilt_y) * 0.60
             self.camera.apply_delta(world_dx, world_dy)
             error = float("nan")
+        if self.beacon_hidden:
+            metrics_state = STATE_PREDICTING
+        elif tracked_pos is not None:
+            metrics_state = STATE_LOCKED
+        else:
+            metrics_state = STATE_SEEKING
+        centroid_error = (
+            math.hypot(tracked_pos[0] - true_local_x, tracked_pos[1] - true_local_y)
+            if tracked_pos is not None and not self.beacon_hidden
+            else float("nan")
+        )
         dist_m = self.scene.estimate_distance_m()
         self.frame_count += 1
         self._stabilize_telemetry(final_conf, source)
@@ -1296,7 +1391,7 @@ class Dashboard(QWidget):
         self.current_source = source
         self.logger.log(
             {
-                "fps": 30.0,
+                "fps": round(self.metrics.current_fps, 2),
                 "source": source,
                 "confidence": final_conf,
                 "error": error,
@@ -1533,8 +1628,20 @@ class Dashboard(QWidget):
                 }
             """)
 
+        self.metrics.end_frame(
+            state=metrics_state,
+            source=source,
+            tracking_error_px=truth_error,
+            centroid_error_px=centroid_error,
+            confidence=final_conf,
+            target_in_fov=target_visible,
+            beacon_hidden=self.beacon_hidden,
+            pattern=self.scene.pattern,
+            disturbances=self.disturbance_mgr.state,
+        )
+
     def closeEvent(self, event):
-        self.logger.close()
+        self.shutdown()
         event.accept()
 
 

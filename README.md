@@ -53,6 +53,33 @@ files it actually uses before you build the installer:
 (I couldn't fetch these files myself while building this - no network access
 in this environment - so this step is on you, but it's copy-paste simple.)
 
+## Performance report
+
+The 2D BORE-SIGHT tab records performance metrics for every run and writes
+a report covering the problem statement's performance log requirements.
+That includes simulation duration, FPS, processing time, acquisition and
+re-acquisition time, average / RMS / maximum tracking error, and lock
+retention / target loss. Each is checked against the spec (acquisition
+<= 2 s, tracking error <= 10 px, target loss < 5 %, re-acquisition <= 1 s,
+>= 20 FPS).
+
+- **GENERATE REPORT** writes the report for the current run and opens it.
+- A report is also saved automatically on **RESET** and when the app
+  closes, if the run has frames that haven't been reported yet.
+
+Each report goes to `reports/report_<date>_<time>/`:
+
+- `report.html`: pass/fail table, statistics and charts (print to PDF
+  from the browser if you need a PDF)
+- `frames.csv`: per-frame log (timing, state, source, tracking and
+  centroiding error)
+- `summary.json`: all summary values
+
+Tracking error is measured against the simulator's ground truth: the
+distance from the true beacon centroid to the boresight in each locked
+frame. Code: `logging_/metrics.py` (collection and statistics) and
+`logging_/report.py` (output).
+
 ## Run it
 
 ```bash

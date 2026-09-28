@@ -42,9 +42,11 @@ if (!sceneContainer) {
     throw new Error('Missing HTML element with id="scene"');
 }
 
-sceneContainer.style.position = "relative";
+// Keep #scene pinned to the full window (style.css: position absolute,
+// inset 0). Forcing position: relative here collapsed it to a 400px strip.
+sceneContainer.style.position = "absolute";
+sceneContainer.style.inset = "0";
 sceneContainer.style.overflow = "hidden";
-sceneContainer.style.minHeight = "400px";
 
 const canvas = renderer.domElement;
 canvas.style.position = "absolute";
@@ -253,27 +255,98 @@ ground.rotation.x = -Math.PI / 2;
 ground.position.y = -65;
 scene.add(ground);
 
-// The main grid is larger than the floor so no floor edge cuts through view.
-// Keep 40-unit line spacing, matching the 10-unit fine grid.
-const grid = new THREE.GridHelper(
-    200000, // Extend beyond every camera angle and zoom level
-    5000,   // Retain 40-unit line spacing
-    0x00dfff,
-    0x174052
-);
+// The floor grid is drawn procedurally on a plane instead of with
+// GridHelper line segments. Long lines that pass under/behind the camera
+// get dropped by line clipping on some WebGL backends (including the
+// software renderer QtWebEngine can fall back to), which left most of the
+// floor without grid. Triangles clip reliably, so a shaded plane covers
+// the whole floor out to the far plane.
+// Same look as before: cyan axis lines, 40-unit major lines (opacity
+// 0.35) and a faint 10-unit fine grid (opacity 0.2).
+const gridMaterial = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    fog: true,
+    uniforms: THREE.UniformsUtils.merge([
+        THREE.UniformsLib.fog,
+        {
+            axisColor: { value: new THREE.Color(0x00dfff) },
+            majorColor: { value: new THREE.Color(0x174052) },
+            minorColor: { value: new THREE.Color(0x041b2a) },
+            majorOpacity: { value: 0.35 },
+            minorOpacity: { value: 0.2 },
+            majorSpacing: { value: 40 },
+            minorSpacing: { value: 10 }
+        }
+    ]),
+    vertexShader: /* glsl */ `
+        #include <fog_pars_vertex>
+        varying vec2 vWorldXZ;
 
+        void main() {
+            vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+            vWorldXZ = worldPosition.xz;
+            vec4 mvPosition = viewMatrix * worldPosition;
+            gl_Position = projectionMatrix * mvPosition;
+            #include <fog_vertex>
+        }
+    `,
+    fragmentShader: /* glsl */ `
+        uniform vec3 axisColor;
+        uniform vec3 majorColor;
+        uniform vec3 minorColor;
+        uniform float majorOpacity;
+        uniform float minorOpacity;
+        uniform float majorSpacing;
+        uniform float minorSpacing;
+        varying vec2 vWorldXZ;
+        #include <fog_pars_fragment>
+
+        // ~1px anti-aliased line coverage; fades out once the cells get
+        // smaller than a couple of pixels so the horizon doesn't moire.
+        float gridLine(vec2 coord, float spacing) {
+            vec2 cell = coord / spacing;
+            vec2 width = fwidth(cell);
+            vec2 dist = abs(fract(cell - 0.5) - 0.5) / width;
+            float line = 1.0 - min(min(dist.x, dist.y), 1.0);
+            return line * (1.0 - smoothstep(0.25, 0.6, max(width.x, width.y)));
+        }
+
+        void main() {
+            float minor = gridLine(vWorldXZ, minorSpacing) * minorOpacity;
+            float major = gridLine(vWorldXZ, majorSpacing) * majorOpacity;
+
+            vec2 axisDist = abs(vWorldXZ) / fwidth(vWorldXZ);
+            float axis = (1.0 - min(min(axisDist.x, axisDist.y), 1.0)) * majorOpacity;
+
+            vec3 color = minorColor;
+            float alpha = minor;
+            if (major >= alpha) {
+                color = majorColor;
+                alpha = major;
+            }
+            if (axis >= alpha && axis > 0.0) {
+                color = axisColor;
+                alpha = axis;
+            }
+            if (alpha <= 0.001) discard;
+
+            gl_FragColor = vec4(color, alpha);
+            #include <tonemapping_fragment>
+            #include <colorspace_fragment>
+            #include <fog_fragment>
+        }
+    `
+});
+
+// Same footprint as the ground plane; everything past the camera's far
+// plane (5000) is clipped anyway, and fog hides the edge.
+const grid = new THREE.Mesh(new THREE.PlaneGeometry(20000, 20000), gridMaterial);
+grid.rotation.x = -Math.PI / 2;
 grid.position.set(0, -62, 0);
-grid.material.transparent = true;
-grid.material.opacity = 0.35;
+// Draw before other transparent objects so it never blends over them.
+grid.renderOrder = -1;
 scene.add(grid);
-
-const secondaryGrid = new THREE.GridHelper(
-    200000, 20000, 0x062638, 0x041b2a
-);
-secondaryGrid.position.set(0, -61, 0);
-secondaryGrid.material.transparent = true;
-secondaryGrid.material.opacity = 0.2;
-scene.add(secondaryGrid);
 
 // ============================================================
 // STARS
