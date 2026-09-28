@@ -407,7 +407,7 @@ const beacon = new THREE.Group();
 
 const beaconCore = new THREE.Mesh(
     new THREE.SphereGeometry(7, 20, 20),
-    new THREE.MeshBasicMaterial({ color: 0xffffff })
+    new THREE.MeshBasicMaterial({ color: 0x35f4ff })
 );
 
 const beaconHalo = new THREE.Mesh(
@@ -426,8 +426,22 @@ beacon.position.set(0, 22, 0);
 rxDrone.add(beacon);
 let beaconHidden = false;
 
+const beaconTargets = [{
+    id: "rx",
+    name: "RX Beacon — Cyan",
+    color: 0x35f4ff,
+    drone: rxDrone,
+    marker: beacon
+}];
+
 // Decoy drones use the same model at half the receiver's scale.
 const decoyDrones = [];
+const decoyBeaconColors = [
+    ["Amber", 0xffb347], ["Magenta", 0xff4fd8], ["Lime", 0xb5ff4d],
+    ["Violet", 0x9a7dff], ["Orange", 0xff7043], ["Gold", 0xffdf5e],
+    ["Rose", 0xff5e7e], ["Mint", 0x4dffb8], ["Blue", 0x4d8dff],
+    ["Coral", 0xff806b]
+];
 const decoyMovementBounds = 520;
 
 for (let index = 0; index < 10; index++) {
@@ -445,6 +459,30 @@ for (let index = 0; index < 10; index++) {
     target.userData.speed = 45 + (index % 4) * 12;
     target.userData.destination = new THREE.Vector3();
     target.userData.destinationValid = false;
+    const [colorName, color] = decoyBeaconColors[index];
+    const marker = new THREE.Group();
+    marker.position.set(0, 22, 0);
+    marker.scale.setScalar(1.8);
+    const core = new THREE.Mesh(
+        new THREE.SphereGeometry(7, 20, 20),
+        new THREE.MeshBasicMaterial({ color })
+    );
+    const halo = new THREE.Mesh(
+        new THREE.SphereGeometry(13, 16, 16),
+        new THREE.MeshBasicMaterial({
+            color, transparent: true, opacity: 0.3,
+            blending: THREE.AdditiveBlending, depthWrite: false
+        })
+    );
+    marker.add(halo, core);
+    target.add(marker);
+    beaconTargets.push({
+        id: `beacon-${index + 1}`,
+        name: `Beacon ${String(index + 1).padStart(2, "0")} — ${colorName}`,
+        color,
+        drone: target,
+        marker
+    });
     scene.add(target);
     decoyDrones.push(target);
 }
@@ -481,14 +519,17 @@ function updateDecoys(deltaTime, elapsed) {
 }
 
 // ============================================================
-// RECEIVER RINGS
+// SELECTED BEACON RINGS
 // ============================================================
 
-function createRing(inner, outer, opacity) {
+const trackingRings = new THREE.Group();
+const trackingRingMeshes = [];
+
+function createRing(inner, outer, opacity, vertical = false) {
     const ring = new THREE.Mesh(
         new THREE.RingGeometry(inner, outer, 64),
         new THREE.MeshBasicMaterial({
-            color: 0x00eaff,
+            color: 0x35f4ff,
             transparent: true,
             opacity,
             blending: THREE.AdditiveBlending,
@@ -497,29 +538,23 @@ function createRing(inner, outer, opacity) {
         })
     );
 
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.y = -63;
-    rxDrone.add(ring);
+    if (vertical) {
+        ring.rotation.y = Math.PI / 2;
+    } else {
+        ring.rotation.x = -Math.PI / 2;
+    }
+    ring.position.y = vertical ? 0 : -63;
+    trackingRings.add(ring);
+    trackingRingMeshes.push(ring);
     return ring;
 }
 
 const ring1 = createRing(35, 38, 0.7);
 const ring2 = createRing(58, 61, 0.55);
 const ring3 = createRing(82, 84, 0.4);
-
-const verticalRing = new THREE.Mesh(
-    new THREE.RingGeometry(34, 37, 64),
-    new THREE.MeshBasicMaterial({
-        color: 0x5cf6ff,
-        transparent: true,
-        opacity: 0.4,
-        blending: THREE.AdditiveBlending,
-        side: THREE.DoubleSide,
-        depthWrite: false
-    })
-);
-verticalRing.rotation.y = Math.PI / 2;
-rxDrone.add(verticalRing);
+const verticalRing = createRing(34, 37, 0.4, true);
+let selectedTrackingBeacon = beaconTargets[0];
+selectedTrackingBeacon.drone.add(trackingRings);
 
 // ============================================================
 // COMMUNICATION BEAM
@@ -904,6 +939,7 @@ const patternSelect = findElement(
 const beaconToggle = document.getElementById("beacon-toggle");
 const decoyCountSlider = document.getElementById("decoy-count");
 const decoyCountValue = document.getElementById("decoy-count-value");
+const trackingBeaconSelect = document.getElementById("tracking-beacon-select");
 
 const trackingStatus = findElement("tracking-status");
 const detectionSource = findElement("detection-source");
@@ -922,9 +958,8 @@ let reacquisitionStarted = null;
 
 function setBeaconHidden(hidden) {
     beaconHidden = Boolean(hidden);
-    [beacon, ring1, ring2, ring3, verticalRing].forEach((object) => {
-        object.visible = !beaconHidden;
-    });
+    selectedTrackingBeacon.marker.visible = !beaconHidden;
+    trackingRings.visible = !beaconHidden;
     if (beaconToggle) {
         beaconToggle.textContent = beaconHidden ? "SHOW BEACON" : "HIDE BEACON";
         beaconToggle.setAttribute("aria-pressed", String(beaconHidden));
@@ -1003,14 +1038,14 @@ function drawAircraftOverlay() {
 // TRACKING AND TELEMETRY
 // ============================================================
 
-const kalmanPosition = beacon.getWorldPosition(new THREE.Vector3());
+const kalmanPosition = selectedTrackingBeacon.marker.getWorldPosition(new THREE.Vector3());
 const kalmanVelocity = new THREE.Vector3();
 let trackingLostTime = 0;
 
 function updateBeaconTracking(deltaTime, elapsed) {
     const dt = Math.max(deltaTime, 1 / 120);
     trackingElapsed += dt;
-    const actualPosition = beacon.getWorldPosition(new THREE.Vector3());
+    const actualPosition = selectedTrackingBeacon.marker.getWorldPosition(new THREE.Vector3());
     const projected = actualPosition.clone().project(camera);
 
     const usingPython2D =
@@ -1124,7 +1159,7 @@ function updateBeaconTracking(deltaTime, elapsed) {
             rxState.textContent = beaconHidden
                 ? "BEACON HIDDEN / PATH LIVE"
                 : detected || recentlyTracked
-                    ? "TRACKING"
+                    ? `TRACKING ${selectedTrackingBeacon.name}`
                     : trackingLostTime > 2.8
                         ? "SEARCHING"
                         : "PREDICTING";
@@ -1152,7 +1187,10 @@ function updateBeaconTracking(deltaTime, elapsed) {
         }
     }
 
-    beacon.scale.setScalar(0.85 + Math.sin(elapsed * 5) * 0.12);
+    selectedTrackingBeacon.marker.scale.setScalar(
+        (selectedTrackingBeacon.id === "rx" ? 1 : 1.8) *
+        (0.85 + Math.sin(elapsed * 5) * 0.12)
+    );
 }
 
 // ============================================================
@@ -1175,7 +1213,10 @@ function resetSimulation() {
     running = false;
     setBeaconHidden(false);
     rxDrone.position.set(0, 80, 0);
-    kalmanPosition.copy(beacon.getWorldPosition(new THREE.Vector3()));
+    receiverAltitudeValue = rxDrone.position.y;
+    receiverAltitudeTarget = receiverAltitudeValue;
+    altitudeChangeRemaining = 1.5;
+    kalmanPosition.copy(selectedTrackingBeacon.marker.getWorldPosition(new THREE.Vector3()));
     kalmanVelocity.set(0, 0, 0);
     trackingLostTime = 0;
     trackingElapsed = 0;
@@ -1229,6 +1270,54 @@ function setDecoyCount(value) {
     });
     if (decoyCountSlider) decoyCountSlider.value = String(count);
     if (decoyCountValue) decoyCountValue.textContent = String(count);
+    refreshTrackingBeaconOptions();
+}
+
+function setTrackingBeacon(id) {
+    const target = beaconTargets.find((item) => item.id === id && item.drone.visible) || beaconTargets[0];
+    selectedTrackingBeacon = target;
+    beaconHidden = false;
+    target.marker.visible = true;
+    trackingRings.removeFromParent();
+    target.drone.add(trackingRings);
+    trackingRings.position.set(0, 0, 0);
+    trackingRings.scale.setScalar(1);
+    trackingRingMeshes.forEach((ring) => ring.material.color.setHex(target.color));
+    trackingRings.visible = true;
+
+    const position = target.marker.getWorldPosition(new THREE.Vector3());
+    kalmanPosition.copy(position);
+    kalmanVelocity.set(0, 0, 0);
+    trackingLostTime = 0;
+    acquisitionTime = null;
+    reacquisitionTime = null;
+    reacquisitionStarted = null;
+    if (beaconToggle) {
+        beaconToggle.textContent = "HIDE BEACON";
+        beaconToggle.setAttribute("aria-pressed", "false");
+    }
+    if (trackingBeaconSelect) trackingBeaconSelect.value = target.id;
+    if (rxState) rxState.textContent = `TRACKING ${target.name}`;
+    if (terminalBeacon) {
+        terminalBeacon.style.setProperty("--selected-beacon-color", `#${target.color.toString(16).padStart(6, "0")}`);
+    }
+}
+
+function refreshTrackingBeaconOptions() {
+    if (!trackingBeaconSelect) return;
+    const available = beaconTargets.filter((target) => target.id === "rx" || target.drone.visible);
+    const stillAvailable = available.some((target) => target.id === selectedTrackingBeacon.id);
+    if (!stillAvailable) setTrackingBeacon("rx");
+
+    trackingBeaconSelect.replaceChildren();
+    available.forEach((target) => {
+        const option = document.createElement("option");
+        option.value = target.id;
+        option.textContent = target.name;
+        option.style.color = `#${target.color.toString(16).padStart(6, "0")}`;
+        trackingBeaconSelect.appendChild(option);
+    });
+    trackingBeaconSelect.value = selectedTrackingBeacon.id;
 }
 
 if (decoyCountSlider) {
@@ -1238,11 +1327,17 @@ if (decoyCountSlider) {
     setDecoyCount(decoyCountSlider.value);
 }
 
+trackingBeaconSelect?.addEventListener("change", () => {
+    setTrackingBeacon(trackingBeaconSelect.value);
+});
+
 if (beaconToggle) {
     beaconToggle.addEventListener("click", () => {
         setBeaconHidden(!beaconHidden);
         if (rxState) {
-            rxState.textContent = beaconHidden ? "BEACON HIDDEN / PATH LIVE" : "TRACKING";
+            rxState.textContent = beaconHidden
+                ? "BEACON HIDDEN / PATH LIVE"
+                : `TRACKING ${selectedTrackingBeacon.name}`;
         }
     });
 }

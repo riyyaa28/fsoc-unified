@@ -311,8 +311,15 @@
                     HIDE BEACON
                 </button>
 
+                <label class="slider-label" for="tracking-beacon-select">
+                    <span>TRACKING TARGET</span>
+                </label>
+                <select id="tracking-beacon-select" aria-label="Choose beacon to track">
+                    <option value="rx">RX Beacon — Cyan</option>
+                </select>
+
                 <label class="slider-label" for="decoy-count">
-                    <span>DECOY BEACONS</span>
+                    <span>ADDITIONAL BEACONS</span>
                     <span id="decoy-count-value">4</span>
                 </label>
                 <input id="decoy-count" type="range" min="0" max="10" step="1" value="4">
