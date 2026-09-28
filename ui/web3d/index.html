@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>FSOC Coarse Alignment Control Center</title>
+
+    <link rel="stylesheet" href="./style.css?v=20260928-5">
+</head>
+
+<body>
+
+    <div id="app">
+
+        <div id="scene"></div>
+        <canvas
+            id="scene-2d"
+            aria-label="2D overhead beacon tracking view"
+        ></canvas>
+        <div id="aircraft-hud" aria-hidden="true">
+            <div class="aircraft-marker transmitter-marker" id="tx-marker">
+                <svg viewBox="0 0 130 100" role="presentation">
+                    <path class="drone-arms" d="M22 22L65 50L108 78M108 22L65 50L22 78" />
+                    <circle class="drone-rotor" cx="22" cy="22" r="11" />
+                    <circle class="drone-rotor" cx="108" cy="22" r="11" />
+                    <circle class="drone-rotor" cx="22" cy="78" r="11" />
+                    <circle class="drone-rotor" cx="108" cy="78" r="11" />
+                    <path class="drone-body" d="M43 41L76 41L88 50L76 59L43 59L35 50Z" />
+                    <circle class="drone-nose" cx="81" cy="50" r="4" />
+                </svg>
+                <span>TX / OPTICAL</span>
+            </div>
+            <div class="aircraft-marker receiver-marker" id="rx-marker">
+                <svg viewBox="0 0 130 100" role="presentation">
+                    <path class="drone-arms" d="M22 22L65 50L108 78M108 22L65 50L22 78" />
+                    <circle class="drone-rotor" cx="22" cy="22" r="11" />
+                    <circle class="drone-rotor" cx="108" cy="22" r="11" />
+                    <circle class="drone-rotor" cx="22" cy="78" r="11" />
+                    <circle class="drone-rotor" cx="108" cy="78" r="11" />
+                    <path class="drone-body" d="M43 41L76 41L88 50L76 59L43 59L35 50Z" />
+                    <circle class="drone-nose" cx="81" cy="50" r="4" />
+                </svg>
+                <span>RX / TRACKED</span>
+            </div>
+        </div>
+
+        <header class="topbar">
+
+            <div class="brand">
+
+                <div class="brand-title">
+                    FSOC COARSE ALIGNMENT
+                </div>
+
+                <div class="brand-subtitle">
+                    OPTICAL LINK CONTROL CENTER
+                </div>
+
+            </div>
+
+            <div class="system-status">
+
+                <div class="status-indicator"></div>
+
+                <div>
+                    <div class="status-title">
+                        SYSTEM ONLINE
+                    </div>
+
+                    <div class="status-subtitle">
+                        SIMULATION MODE
+                    </div>
+                </div>
+
+            </div>
+
+        </header>
+
+        <aside class="left-panel">
+
+            <div class="panel-title">
+                TRACKING TELEMETRY
+            </div>
+
+            <div class="telemetry-card">
+
+                <div class="telemetry-label">
+                    TRACKING STATUS
+                </div>
+
+                <div
+                    id="tracking-status"
+                    class="telemetry-value status-lock"
+                >
+                    LOCKED
+                </div>
+
+            </div>
+
+            <div class="telemetry-card">
+                <div class="telemetry-label">ACQUISITION / REACQUISITION</div>
+                <div id="acquisition-time" class="telemetry-value">-- / -- s</div>
+            </div>
+
+            <div class="telemetry-card">
+
+                <div class="telemetry-label">
+                    DETECTION SOURCE
+                </div>
+
+                <div
+                    id="detection-source"
+                    class="telemetry-value"
+                >
+                    YOLO
+                </div>
+
+            </div>
+
+            <div class="telemetry-card">
+
+                <div class="telemetry-label">
+                    CONFIDENCE
+                </div>
+
+                <div
+                    id="confidence"
+                    class="telemetry-value"
+                >
+                    94.2%
+                </div>
+
+            </div>
+
+            <div class="telemetry-card">
+
+                <div class="telemetry-label">
+                    TRACKING ERROR
+                </div>
+
+                <div
+                    id="tracking-error"
+                    class="telemetry-value"
+                >
+                    3.8 px
+                </div>
+
+            </div>
+
+            <div class="telemetry-card">
+
+                <div class="telemetry-label">
+                    FPS
+                </div>
+
+                <div
+                    id="fps"
+                    class="telemetry-value"
+                >
+                    30
+                </div>
+
+            </div>
+
+            <div class="telemetry-card">
+
+                <div class="telemetry-label">
+                    LINK STATUS
+                </div>
+
+                <div
+                    id="link-status"
+                    class="telemetry-value status-lock"
+                >
+                    ALIGNED
+                </div>
+
+            </div>
+
+        </aside>
+
+        <aside class="right-panel">
+
+            <div class="panel-title">
+                OPTICAL TERMINAL
+            </div>
+
+            <div class="terminal-visual">
+
+                <div class="terminal-ring ring-outer"></div>
+                <div class="terminal-ring ring-middle"></div>
+                <div class="terminal-ring ring-inner"></div>
+
+                <div
+                    id="terminal-beacon"
+                    class="terminal-center"
+                ></div>
+
+            </div>
+
+            <div class="terminal-data">
+
+                <div class="data-row">
+                    <span>TX</span>
+                    <span id="tx-state">ACTIVE</span>
+                </div>
+
+                <div class="data-row">
+                    <span>RX</span>
+                    <span id="rx-state">TRACKING</span>
+                </div>
+
+                <div class="data-row">
+                    <span>PAN</span>
+                    <span id="pan-value">0.0°</span>
+                </div>
+
+                <div class="data-row">
+                    <span>TILT</span>
+                    <span id="tilt-value">0.0°</span>
+                </div>
+
+                <div class="data-row">
+                    <span>ZOOM</span>
+                    <span id="zoom-value">1.0×</span>
+                </div>
+
+            </div>
+
+        </aside>
+
+        <div class="bottom-panel">
+
+            <div class="control-section">
+
+                <div class="panel-title">
+                    SIMULATION CONTROL
+                </div>
+
+                <div class="button-row">
+
+                    <button
+                        id="start-button"
+                        class="control-button primary"
+                    >
+                        START
+                    </button>
+
+                    <button
+                        id="pause-button"
+                        class="control-button"
+                    >
+                        PAUSE
+                    </button>
+
+                    <button
+                        id="reset-button"
+                        class="control-button"
+                    >
+                        RESET
+                    </button>
+
+                </div>
+
+            </div>
+
+            <div class="control-section">
+
+                <div class="panel-title">
+                    MOVEMENT PATTERN
+                </div>
+
+                <select id="pattern-select">
+
+                    <option value="auto">
+                        AUTO
+                    </option>
+
+                    <option value="circular" selected>
+                        CIRCULAR
+                    </option>
+
+                    <option value="figure8">
+                        FIGURE 8
+                    </option>
+
+                    <option value="straight">
+                        STRAIGHT
+                    </option>
+
+                    <option value="random">
+                        RANDOM
+                    </option>
+
+                </select>
+
+            </div>
+
+            <div class="control-section beacon-controls">
+
+                <div class="panel-title">
+                    BEACON / DECOYS
+                </div>
+
+                <button id="beacon-toggle" class="control-button" type="button" aria-pressed="false">
+                    HIDE BEACON
+                </button>
+
+                <label class="slider-label" for="decoy-count">
+                    <span>DECOY BEACONS</span>
+                    <span id="decoy-count-value">4</span>
+                </label>
+                <input id="decoy-count" type="range" min="0" max="10" step="1" value="4">
+
+            </div>
+
+            <div class="control-section">
+
+                <div class="panel-title">
+                    ENVIRONMENT
+                </div>
+
+                <div class="environment-grid">
+
+                    <div
+                        class="environment-item"
+                        data-effect="fog"
+                        role="button"
+                        tabindex="0"
+                        aria-label="Fog disturbance level 0"
+                    >
+
+                        <span>FOG</span>
+
+                        <div class="level-indicator">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+
+                    </div>
+
+                    <div
+                        class="environment-item"
+                        data-effect="rain"
+                        role="button"
+                        tabindex="0"
+                        aria-label="Rain disturbance level 0"
+                    >
+
+                        <span>RAIN</span>
+
+                        <div class="level-indicator">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+
+                    </div>
+
+                    <div
+                        class="environment-item"
+                        data-effect="gaussian"
+                        role="button"
+                        tabindex="0"
+                        aria-label="Gaussian disturbance level 0"
+                    >
+
+                        <span>GAUSSIAN</span>
+
+                        <div class="level-indicator">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+
+                    </div>
+
+                    <div
+                        class="environment-item"
+                        data-effect="salt-pepper"
+                        role="button"
+                        tabindex="0"
+                        aria-label="Salt and pepper disturbance level 0"
+                    >
+
+                        <span>SALT / PEPPER</span>
+
+                        <div class="level-indicator">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+
+                    </div>
+
+                </div>
+
+            </div>
+
+        </div>
+
+        <div class="mode-indicator" id="engine-status">
+            3D ENGINE STARTING
+        </div>
+
+        <div class="help-indicator">
+            DRAG TO ROTATE · SCROLL TO ZOOM
+        </div>
+
+    </div>
+
+    <!-- IMPORTANT:
+         app.js must load AFTER the HTML exists. -->
+<script>
+    (() => {
+        const status = document.getElementById("engine-status");
+        const showFailure = (message) => {
+            status.textContent = `3D ENGINE ERROR: ${message}`;
+            status.classList.add("engine-error");
+        };
+        window.addEventListener("error", (event) => {
+            if (!window.fsocReady) showFailure(event.message || "module failed to load");
+        });
+        window.addEventListener("unhandledrejection", (event) => {
+            if (!window.fsocReady) showFailure(event.reason?.message || String(event.reason));
+        });
+        window.setTimeout(() => {
+            if (!window.fsocReady) showFailure("Three.js did not initialize; check module and WebGL loading");
+        }, 5000);
+    })();
+</script>
+<script type="module" src="./app.js?v=20260928-4" onerror="document.getElementById('engine-status').textContent='3D ENGINE ERROR: app.js failed to load';document.getElementById('engine-status').classList.add('engine-error')"></script>
+
+</body>
+</html>
