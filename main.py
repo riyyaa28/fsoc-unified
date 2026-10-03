@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import json
 import threading
 import torch
 from functools import partial
@@ -9,8 +10,11 @@ from urllib.parse import unquote, urlsplit
 
 
 from PyQt5.QtCore import QUrl, QTimer
+from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget
-from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineSettings
+from PyQt5.QtWebEngineWidgets import (
+    QWebEngineDownloadItem, QWebEngineSettings, QWebEngineView
+)
 
 # Import must happen before we build the tabs, same ordering FSOC_FINAL relied on.
 from ui.dashboard import Dashboard  # noqa: E402  (2D BORE-SIGHT, unmodified)
@@ -167,6 +171,13 @@ class MainWindow(QMainWindow):
             QWebEngineSettings.WebGLEnabled, True
         )
 
+        # QWebEngineView drops downloads unless something accepts them; save
+        # reports straight to the user's Downloads folder.
+        self._active_downloads = []
+        self.airspace_view.page().profile().downloadRequested.connect(
+            self._on_download_requested
+        )
+
         handler = partial(WebHandler, directory=BASE_DIR)
 
         self.web_server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -213,6 +224,34 @@ class MainWindow(QMainWindow):
         self._loaded_web3d_signature = self._web3d_asset_signature()
         if success:
             self._refresh_airspace_view()
+
+    def _on_download_requested(self, item):
+        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        os.makedirs(downloads_dir, exist_ok=True)
+        suggested = os.path.basename(item.path()) or "fsoc-technical-report.pdf"
+        stem, ext = os.path.splitext(suggested)
+        target = os.path.join(downloads_dir, suggested)
+        counter = 1
+        while os.path.exists(target):
+            target = os.path.join(downloads_dir, f"{stem} ({counter}){ext}")
+            counter += 1
+        item.setPath(target)
+        self._active_downloads.append(item)
+        item.finished.connect(lambda: self._on_download_finished(item, target))
+        item.accept()
+
+    def _on_download_finished(self, item, target):
+        if item in self._active_downloads:
+            self._active_downloads.remove(item)
+        ok = item.state() == QWebEngineDownloadItem.DownloadCompleted
+        self.airspace_view.page().runJavaScript(
+            "window.fsocReportDownloaded && "
+            f"window.fsocReportDownloaded({json.dumps(target)}, {json.dumps(ok)})"
+        )
+        if ok:
+            # Open the report that was just written, so an older file in
+            # Downloads is never mistaken for it.
+            QDesktopServices.openUrl(QUrl.fromLocalFile(target))
 
     def _refresh_airspace_view(self):
         if self.tabs.currentWidget() is self.airspace_view:

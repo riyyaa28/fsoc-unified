@@ -1,10 +1,14 @@
-from disturbance.effects import add_gaussian_noise, add_fog, add_jitter, add_rain
+from disturbance.effects import (
+    add_gaussian_noise, add_poisson_noise, add_fog, add_jitter, add_rain
+)
 
 
 class DisturbanceManager:
     LEVELS = {
         "fog": {0: 0.0, 1: 0.15, 2: 0.30, 3: 0.50},
         "noise": {0: 0, 1: 8, 2: 18, 3: 35},
+        # Photons at full brightness: fewer photons -> stronger shot noise.
+        "poisson": {0: 0, 1: 60.0, 2: 20.0, 3: 6.0},
         "jitter": {0: 0, 1: 2, 2: 5, 3: 10},
         "rain": {0: 0.0, 1: 0.2, 2: 0.4, 3: 0.6},
     }
@@ -20,6 +24,10 @@ class DisturbanceManager:
         if self.state["noise"] > 0:
             out = add_gaussian_noise(
                 out, sigma=self.LEVELS["noise"][self.state["noise"]]
+            )
+        if self.state["poisson"] > 0:
+            out = add_poisson_noise(
+                out, peak=self.LEVELS["poisson"][self.state["poisson"]]
             )
         if self.state["fog"] > 0:
             out = add_fog(out, intensity=self.LEVELS["fog"][self.state["fog"]])

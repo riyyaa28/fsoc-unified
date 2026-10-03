@@ -42,9 +42,11 @@ if (!sceneContainer) {
     throw new Error('Missing HTML element with id="scene"');
 }
 
-sceneContainer.style.position = "relative";
+sceneContainer.style.position = "absolute";
+sceneContainer.style.inset = "0";
+sceneContainer.style.width = "100%";
+sceneContainer.style.height = "100%";
 sceneContainer.style.overflow = "hidden";
-sceneContainer.style.minHeight = "400px";
 
 const canvas = renderer.domElement;
 canvas.style.position = "absolute";
@@ -63,8 +65,8 @@ const rxMarker = document.getElementById("rx-marker");
 
 function resizeRenderer() {
     const bounds = sceneContainer.getBoundingClientRect();
-    const width = Math.floor(bounds.width);
-    const height = Math.floor(bounds.height);
+    const width = Math.floor(bounds.width || window.innerWidth);
+    const height = Math.floor(bounds.height || window.innerHeight);
 
     if (width <= 0 || height <= 0) return;
 
@@ -170,7 +172,7 @@ canvas.addEventListener("pointermove", (event) => {
             enforceSeparation();
             simulationTime = 0;
             randomTargetValid = false;
-            transitioning = false;
+            patternTransition = null;
         }
         return;
     }
@@ -253,11 +255,10 @@ ground.rotation.x = -Math.PI / 2;
 ground.position.y = -65;
 scene.add(ground);
 
-// The main grid is larger than the floor so no floor edge cuts through view.
-// Keep 40-unit line spacing, matching the 10-unit fine grid.
+// Extend the grid beyond the floor so no floor edge cuts through the view.
 const grid = new THREE.GridHelper(
-    200000, // Extend beyond every camera angle and zoom level
-    5000,   // Retain 40-unit line spacing
+    200000,
+    5000, // 40-unit line spacing
     0x00dfff,
     0x174052
 );
@@ -393,10 +394,11 @@ const rxDrone = createDrone();
 rxDrone.scale.setScalar(1.4);
 rxDrone.position.set(0, 80, 0);
 scene.add(rxDrone);
-const MIN_DRONE_SEPARATION = 5 / 0.3;
+const METERS_PER_WORLD_UNIT = 0.3;
+const MIN_DRONE_SEPARATION = 5 / METERS_PER_WORLD_UNIT;
 function enforceSeparation() {
     const offset = rxDrone.position.clone().sub(txDrone.position);
-    if (offset.length() < MIN_DRONE_SEPARATION) {
+    if (offset.lengthSq() < MIN_DRONE_SEPARATION ** 2) {
         if (offset.lengthSq() < 1e-6) offset.set(0, 0, 1);
         rxDrone.position.copy(txDrone.position).add(offset.normalize().multiplyScalar(MIN_DRONE_SEPARATION));
     }
@@ -567,7 +569,8 @@ const disturbanceLevels = {
     fog: 0,
     rain: 0,
     gaussian: 0,
-    "salt-pepper": 0
+    "salt-pepper": 0,
+    poisson: 0
 };
 
 function setDisturbance(effect, level) {
@@ -586,7 +589,9 @@ function setDisturbance(effect, level) {
         Math.round(Number(level) || 0), 0, maxLevel
     );
 
+    const changed = disturbanceLevels[effect] !== safeLevel;
     disturbanceLevels[effect] = safeLevel;
+    if (changed) recordActivity("PARAMETER", `${effect} disturbance set to level ${safeLevel}`);
 
     bars.forEach((bar, index) => {
         bar.classList.toggle("active", index < safeLevel);
@@ -635,9 +640,17 @@ let pattern = "circular";
 let autoMode = false;
 let autoSwitchRemaining = 9;
 let simulationTime = 0;
-let transitioning = false;
 let randomTarget = new THREE.Vector3();
 let randomTargetValid = false;
+let patternTransition = null;
+const receiverVelocity = new THREE.Vector3();
+const previousReceiverPosition = rxDrone.position.clone();
+const PATTERN_TRANSITION_DURATION = 2.2;
+const MIN_RECEIVER_ALTITUDE = 65;
+const MAX_RECEIVER_ALTITUDE = 180;
+let receiverAltitudeValue = rxDrone.position.y;
+let receiverAltitudeTarget = 112;
+let altitudeChangeRemaining = 2.5;
 
 const trailPoints = [];
 const maxTrailPoints = 700;
@@ -698,20 +711,20 @@ function updateTrail() {
     trail.visible = trailPoints.length >= 2;
 }
 
-function chooseRandomTarget() {
+function chooseRandomTarget(position = rxDrone.position) {
     randomTarget.set(
         (Math.random() - 0.5) * 680,
-        rxDrone.position.y,
+        position.y,
         (Math.random() - 0.5) * 680
     );
     randomTargetValid = true;
 }
 
-function updateRandom(deltaTime) {
-    if (!randomTargetValid) chooseRandomTarget();
+function updateRandom(deltaTime, position = rxDrone.position) {
+    if (!randomTargetValid) chooseRandomTarget(position);
 
-    const dx = randomTarget.x - rxDrone.position.x;
-    const dz = randomTarget.z - rxDrone.position.z;
+    const dx = randomTarget.x - position.x;
+    const dz = randomTarget.z - position.z;
     const distance = Math.hypot(dx, dz);
 
     if (distance < 10) {
@@ -720,13 +733,52 @@ function updateRandom(deltaTime) {
     }
 
     const step = Math.min(110 * deltaTime, distance);
-    rxDrone.position.x += (dx / distance) * step;
-    rxDrone.position.z += (dz / distance) * step;
+    position.x += (dx / distance) * step;
+    position.z += (dz / distance) * step;
 }
 
-function receiverAltitude(time) {
-    // Keep RX near the operating altitude so the camera and ground grid stay stable.
-    return 105 + 22 * Math.sin(time * 0.42);
+function beginPatternTransition() {
+    patternTransition = {
+        start: rxDrone.position.clone(),
+        startVelocity: receiverVelocity.clone().clampLength(0, 180),
+        pathPosition: rxDrone.position.clone(),
+        elapsed: 0
+    };
+    simulationTime = 0;
+    randomTargetValid = false;
+    clearTrail();
+}
+
+function updatePatternPath(position, time) {
+    if (pattern === "circular") {
+        const angle = time * 0.55;
+        const radius = 255;
+        position.x = radius * Math.sin(angle);
+        position.z = radius * (1 - Math.cos(angle));
+    } else if (pattern === "figure8") {
+        const angle = time * 0.5;
+        position.x = 300 * Math.sin(angle);
+        position.z = 190 * Math.sin(angle * 2);
+    } else if (pattern === "straight") {
+        position.x = 360 * Math.sin(time * 0.22);
+        position.z = 0;
+    }
+}
+
+function updateReceiverAltitude(deltaTime) {
+    altitudeChangeRemaining -= deltaTime;
+    if (altitudeChangeRemaining <= 0) {
+        receiverAltitudeTarget = MIN_RECEIVER_ALTITUDE +
+            Math.random() * (MAX_RECEIVER_ALTITUDE - MIN_RECEIVER_ALTITUDE);
+        altitudeChangeRemaining = 3 + Math.random() * 5;
+        recordActivity("ALTITUDE", `RX altitude target changed to ${(receiverAltitudeTarget * METERS_PER_WORLD_UNIT).toFixed(1)} m`);
+    }
+
+    // Smoothly drift toward a new random altitude instead of stepping vertically.
+    const response = 1 - Math.exp(-0.55 * deltaTime);
+    receiverAltitudeValue +=
+        (receiverAltitudeTarget - receiverAltitudeValue) * response;
+    return receiverAltitudeValue;
 }
 
 function chooseAutoPattern() {
@@ -748,57 +800,48 @@ function updatePattern(deltaTime) {
         if (autoSwitchRemaining <= 0) {
             pattern = chooseAutoPattern();
             autoSwitchRemaining = 8 + Math.random() * 5;
-            simulationTime = 0;
-            randomTargetValid = false;
-            transitioning = true;
+            recordActivity("PATTERN", `AUTO selected ${pattern}`);
+            beginPatternTransition();
             return;
         }
     }
 
     simulationTime += deltaTime;
-    rxDrone.position.y = receiverAltitude(simulationTime);
+    const altitude = updateReceiverAltitude(deltaTime);
+    if (patternTransition) {
+        const transition = patternTransition;
+        transition.elapsed += deltaTime;
+        transition.pathPosition.y = altitude;
+        if (pattern === "random") {
+            updateRandom(deltaTime, transition.pathPosition);
+        } else {
+            updatePatternPath(transition.pathPosition, simulationTime);
+        }
 
-    if (pattern === "random") {
-        updateRandom(deltaTime);
-    } else if (pattern === "circular") {
-        const angle = simulationTime * 0.55;
-        const radius = 255;
-        rxDrone.position.x = radius * Math.sin(angle);
-        rxDrone.position.z = radius * (1 - Math.cos(angle));
-    } else if (pattern === "figure8") {
-        const angle = simulationTime * 0.5;
+        const progress = THREE.MathUtils.clamp(
+            transition.elapsed / PATTERN_TRANSITION_DURATION, 0, 1
+        );
+        const easedProgress = progress * progress * (3 - 2 * progress);
+        const carriedPosition = transition.start.clone().addScaledVector(
+            transition.startVelocity, transition.elapsed
+        );
+        rxDrone.position.lerpVectors(
+            carriedPosition, transition.pathPosition, easedProgress
+        );
 
-        rxDrone.position.x =
-            305 * Math.sin(angle) + 65 * Math.sin(angle * 3);
-
-        rxDrone.position.z =
-            175 * Math.sin(angle * 2) + 45 * Math.sin(angle * 3);
-    } else if (pattern === "straight") {
-        const t = simulationTime * 0.32;
-        rxDrone.position.x = 390 * Math.sin(t);
-        rxDrone.position.z = 105 * Math.sin(t * 2.4);
+        if (progress >= 1) {
+            rxDrone.position.copy(transition.pathPosition);
+            patternTransition = null;
+        }
+    } else {
+        rxDrone.position.y = altitude;
+        if (pattern === "random") {
+            updateRandom(deltaTime);
+        } else {
+            updatePatternPath(rxDrone.position, simulationTime);
+        }
     }
     enforceSeparation();
-}
-
-function transitionToOrigin(deltaTime) {
-    const x = rxDrone.position.x;
-    const z = rxDrone.position.z;
-    const distance = Math.hypot(x, z);
-
-    if (distance < 2) {
-        rxDrone.position.x = 0;
-        rxDrone.position.z = 0;
-        transitioning = false;
-        simulationTime = 0;
-        randomTargetValid = false;
-        clearTrail();
-        return;
-    }
-
-    const step = Math.min(160 * deltaTime, distance);
-    rxDrone.position.x += (-x / distance) * step;
-    rxDrone.position.z += (-z / distance) * step;
 }
 
 // ============================================================
@@ -857,11 +900,17 @@ function updateBeam(elapsed) {
             ? 0.18
             : 1;
 
+    // Photon shot noise: the received intensity fluctuates randomly each
+    // frame, with a larger spread at higher levels.
+    const shotNoise = disturbanceLevels.poisson > 0
+        ? 1 - Math.random() * disturbanceLevels.poisson * 0.14
+        : 1;
+
     beamCore.material.opacity =
-        0.72 * fogAttenuation * rainAttenuation * speckle;
+        0.72 * fogAttenuation * rainAttenuation * speckle * shotNoise;
 
     beamGlow.material.opacity =
-        0.13 * fogAttenuation * rainAttenuation * speckle;
+        0.13 * fogAttenuation * rainAttenuation * speckle * shotNoise;
 
     const pulse = (elapsed * 0.7) % 1;
     beamPulse.position.copy(
@@ -896,6 +945,10 @@ const pauseButton = findElement(
 const resetButton = findElement(
     "reset-button", "resetBtn", "resetButton", "reset", "RESET"
 );
+const performanceButton = document.getElementById("performance-button");
+const reportButton = document.getElementById("report-button");
+const performanceModal = document.getElementById("performance-modal");
+const performanceCloseButton = document.getElementById("performance-close");
 const patternSelect = findElement(
     "pattern-select", "patternSelect", "pattern",
     "movementPattern", "movement"
@@ -908,6 +961,7 @@ const trackingStatus = findElement("tracking-status");
 const detectionSource = findElement("detection-source");
 const confidenceDisplay = findElement("confidence");
 const errorDisplay = findElement("tracking-error");
+const fpsDisplay = findElement("fps");
 const rxState = findElement("rx-state");
 const panDisplay = findElement("pan-value");
 const tiltDisplay = findElement("tilt-value");
@@ -918,6 +972,690 @@ let trackingElapsed = 0;
 let acquisitionTime = null;
 let reacquisitionTime = null;
 let reacquisitionStarted = null;
+let performanceDuration = 0;
+let performanceSampleClock = 0;
+let performanceSamples = [];
+let reportSamples = [];
+const MAX_REPORT_SAMPLES = 7200;
+const activityLog = [];
+let activitySampleClock = 0;
+let activityLastState = "";
+let activityAlertState = new Set();
+let currentFrameRate = 0;
+let currentProcessingMs = 0;
+let currentTrackingErrorPx = 0;
+let totalTrackingErrorPx = 0;
+let maxTrackingErrorPx = 0;
+let trackedFrames = 0;
+let lockedFrames = 0;
+const MAX_PERFORMANCE_SAMPLES = 120;
+const MAX_ACTIVITY_LOG = 3000;
+
+function recordActivity(event, details, level = "INFO") {
+    const time = new Date().toLocaleTimeString();
+    activityLog.push({ time, event, details: String(details), level });
+    if (activityLog.length > MAX_ACTIVITY_LOG) activityLog.splice(0, 500);
+    if (event !== "SAMPLE") renderActivityPanel();
+}
+
+const ACTIVITY_PANEL_LIMIT = 150;
+
+function renderActivityPanel() {
+    const list = document.getElementById("activity-panel-list");
+    if (!list) return;
+    const events = activityLog.filter((entry) => entry.event !== "SAMPLE");
+    const counter = document.getElementById("activity-panel-count");
+    if (counter) counter.textContent = String(events.length);
+    list.textContent = "";
+    if (!events.length) {
+        const empty = document.createElement("li");
+        empty.className = "activity-empty";
+        empty.textContent = "No events yet. Press START.";
+        list.appendChild(empty);
+        return;
+    }
+    events.slice(-ACTIVITY_PANEL_LIMIT).reverse().forEach((entry) => {
+        const item = document.createElement("li");
+        if (entry.level === "ALERT") item.className = "level-alert";
+        const meta = document.createElement("div");
+        meta.className = "activity-meta";
+        const name = document.createElement("span");
+        name.className = "activity-event";
+        name.textContent = entry.event;
+        const time = document.createElement("span");
+        time.textContent = entry.time;
+        meta.append(name, time);
+        const details = document.createElement("span");
+        details.className = "activity-details";
+        details.textContent = entry.details;
+        item.append(meta, details);
+        list.appendChild(item);
+    });
+    list.scrollTop = 0;
+}
+
+function sampleBeaconActivity() {
+    const status = trackingStatus?.textContent?.trim() || "UNKNOWN";
+    if (status !== activityLastState) {
+        recordActivity("TRACKING", `Beacon state changed to ${status}`);
+        activityLastState = status;
+    }
+    const lock = trackedFrames ? lockedFrames / trackedFrames * 100 : 100;
+    const distanceMeters = rxDrone.position.distanceTo(txDrone.position) * METERS_PER_WORLD_UNIT;
+    const fpsLow = currentFrameRate > 0 && currentFrameRate < 30;
+    const lockLow = trackedFrames > 0 && lock < 95;
+    const separationLow = distanceMeters < 5;
+    const checks = [
+        ["fps", fpsLow, `Frame rate ${currentFrameRate.toFixed(1)} FPS (reference 30 FPS)`],
+        ["lock", lockLow, `Lock retention ${lock.toFixed(1)}% (reference 95%)`],
+        ["separation", separationLow, `TX/RX separation ${distanceMeters.toFixed(2)} m (reference 5 m)`]
+    ];
+    checks.forEach(([key, violated, details]) => {
+        if (violated && !activityAlertState.has(key)) recordActivity("THRESHOLD ALERT", details, "ALERT");
+        if (!violated && activityAlertState.has(key)) recordActivity("THRESHOLD CLEARED", `${key.toUpperCase()} back within reference`);
+        if (violated) activityAlertState.add(key); else activityAlertState.delete(key);
+    });
+    const disturbanceText = Object.entries(disturbanceLevels).map(([name, value]) => `${name}=${value}`).join(", ");
+    recordActivity("SAMPLE", `pattern=${pattern}; state=${status}; altitude=${(rxDrone.position.y * METERS_PER_WORLD_UNIT).toFixed(1)}m; separation=${distanceMeters.toFixed(1)}m; decoys=${decoyDrones.filter((drone) => drone.visible).length}; disturbances=${disturbanceText}; confidence=${confidenceDisplay?.textContent || "--"}; error=${errorDisplay?.textContent || "--"}; fps=${currentFrameRate.toFixed(1)}`);
+}
+
+const REPORT_REQUIREMENTS = { fps: 30, lock: 95, targetLoss: 5, processingMs: 1000 / 30, separation: 5 };
+
+function reportSeriesStats(field) {
+    const values = reportSamples.map((sample) => sample[field]).filter((value) => Number.isFinite(value));
+    if (!values.length) return null;
+    return {
+        min: Math.min(...values),
+        max: Math.max(...values),
+        mean: values.reduce((sum, value) => sum + value, 0) / values.length
+    };
+}
+
+function buildTechnicalReportPdf() {
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, "0");
+    const reportId = `FSOC-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    const lock = trackedFrames ? lockedFrames / trackedFrames * 100 : null;
+    const targetLoss = lock === null ? null : 100 - lock;
+    const meanError = trackedFrames ? totalTrackingErrorPx / trackedFrames : null;
+    const distanceMeters = rxDrone.position.distanceTo(txDrone.position) * METERS_PER_WORLD_UNIT;
+    const fpsStats = reportSeriesStats("fps");
+    const errorStats = reportSeriesStats("error");
+    const lockStats = reportSeriesStats("lock");
+    const processingStats = reportSeriesStats("processing");
+    const mainEvents = activityLog.filter((entry) => entry.event !== "SAMPLE");
+    const sampleCount = activityLog.length - mainEvents.length;
+    const fmt = (value, digits, unit) => (value === null || value === undefined || !Number.isFinite(value)) ? "--" : `${value.toFixed(digits)}${unit}`;
+    const trackingChanges = mainEvents.filter((entry) => entry.event === "TRACKING").length;
+    const parameterChanges = mainEvents.filter((entry) => ["PARAMETER", "PATTERN", "ALTITUDE", "BEACON"].includes(entry.event)).length;
+
+    const metricRows = [
+        ["Mean frame rate", fmt(fpsStats?.mean, 1, " FPS"), "30 Hz update rate"],
+        ["Frame rate range", fpsStats ? `${fpsStats.min.toFixed(1)} - ${fpsStats.max.toFixed(1)} FPS` : "--", "30 Hz update rate"],
+        ["Lock retention", fmt(lock, 2, " %"), "95 %"],
+        ["Target loss", fmt(targetLoss, 2, " %"), "5 %"],
+        ["Acquisition time", fmt(acquisitionTime, 2, " s"), "Logged"],
+        ["Re-acquisition time", fmt(reacquisitionTime, 2, " s"), "Logged"],
+        ["Mean tracking error", fmt(meanError, 2, " px"), "Logged"],
+        ["Max tracking error", trackedFrames ? `${maxTrackingErrorPx.toFixed(2)} px` : "--", "Logged"],
+        ["Mean processing time", fmt(processingStats?.mean, 2, " ms"), "33.3 ms frame budget"],
+        ["TX/RX separation", `${distanceMeters.toFixed(1)} m`, "5 m minimum spacing"]
+    ];
+    const hasRun = performanceDuration > 0 && reportSamples.length > 0;
+    // Neutral names for the log's threshold events.
+    const reportEventName = (event) => ({ "THRESHOLD ALERT": "REFERENCE CROSSED", "THRESHOLD CLEARED": "REFERENCE RESTORED" })[event] || event;
+
+    // ---- Minimal PDF writer (A4, standard Type1 fonts, vector graphics) ----
+    const PAGE_W = 595, PAGE_H = 842, MARGIN = 50, CONTENT_W = PAGE_W - MARGIN * 2;
+    const TOP = PAGE_H - 70, BOTTOM = 60;
+    const FONTS = { regular: "F1", bold: "F2", mono: "F3" };
+    const WIDTH_FACTOR = { regular: 0.5, bold: 0.55, mono: 0.6 };
+    const pages = [];
+    let ops = null;
+    let y = TOP;
+
+    const toAscii = (value) => String(value)
+        .replace(/°/g, " deg").replace(/×/g, "x").replace(/≥/g, ">=").replace(/≤/g, "<=").replace(/[–—]/g, "-")
+        .normalize("NFKD").replace(/[^\x20-\x7E]/g, "");
+    const esc = (value) => toAscii(value).replace(/([\\()])/g, "\\$1");
+    const rgb = (hex) => [1, 3, 5].map((i) => (parseInt(hex.slice(i, i + 2), 16) / 255).toFixed(3)).join(" ");
+    const textWidth = (value, font, size) => toAscii(value).length * size * WIDTH_FACTOR[font];
+
+    function text(x, yy, value, { font = "regular", size = 10, color = "#1a2733", align = "left" } = {}) {
+        let tx = x;
+        if (align === "right") tx = x - textWidth(value, font, size);
+        if (align === "center") tx = x - textWidth(value, font, size) / 2;
+        ops.push(`BT ${rgb(color)} rg /${FONTS[font]} ${size} Tf ${tx.toFixed(2)} ${yy.toFixed(2)} Td (${esc(value)}) Tj ET`);
+    }
+    function rect(x, yy, w, h, fill, stroke) {
+        if (fill) ops.push(`${rgb(fill)} rg ${x.toFixed(2)} ${yy.toFixed(2)} ${w.toFixed(2)} ${h.toFixed(2)} re f`);
+        if (stroke) ops.push(`${rgb(stroke)} RG 0.6 w ${x.toFixed(2)} ${yy.toFixed(2)} ${w.toFixed(2)} ${h.toFixed(2)} re S`);
+    }
+    function line(x1, y1, x2, y2, color = "#c5d2dc", width = 0.6, dash = null) {
+        ops.push(`${dash ? `[${dash}] 0 d ` : ""}${rgb(color)} RG ${width} w ${x1.toFixed(2)} ${y1.toFixed(2)} m ${x2.toFixed(2)} ${y2.toFixed(2)} l S${dash ? " [] 0 d" : ""}`);
+    }
+    function wrap(value, font, size, maxWidth) {
+        const words = toAscii(value).split(/\s+/).filter(Boolean);
+        const maxChars = Math.max(4, Math.floor(maxWidth / (size * WIDTH_FACTOR[font])));
+        const out = [];
+        let current = "";
+        words.forEach((word) => {
+            while (word.length > maxChars) {
+                if (current) { out.push(current); current = ""; }
+                out.push(word.slice(0, maxChars));
+                word = word.slice(maxChars);
+            }
+            if (current && (current.length + 1 + word.length) > maxChars) {
+                out.push(current);
+                current = word;
+            } else {
+                current = current ? `${current} ${word}` : word;
+            }
+        });
+        if (current) out.push(current);
+        return out.length ? out : [""];
+    }
+    function newPage() {
+        ops = [];
+        pages.push(ops);
+        y = TOP;
+    }
+    function ensureSpace(height) {
+        if (y - height < BOTTOM) newPage();
+    }
+    function heading(number, title) {
+        ensureSpace(110);
+        y -= 12;
+        text(MARGIN, y, `${number}. ${title.toUpperCase()}`, { font: "bold", size: 12, color: "#0b4f6c" });
+        y -= 6;
+        line(MARGIN, y, MARGIN + CONTENT_W, y, "#1b9fc4", 1);
+        y -= 16;
+    }
+    function paragraph(value, { size = 10, font = "regular", color = "#1a2733", gap = 6 } = {}) {
+        wrap(value, font, size, CONTENT_W).forEach((ln) => {
+            ensureSpace(size + 4);
+            text(MARGIN, y, ln, { font, size, color });
+            y -= size + 4;
+        });
+        y -= gap;
+    }
+    function bullet(value) {
+        wrap(value, "regular", 10, CONTENT_W - 16).forEach((ln, index) => {
+            ensureSpace(14);
+            if (index === 0) text(MARGIN + 4, y, "-", { size: 10, color: "#1b9fc4", font: "bold" });
+            text(MARGIN + 16, y, ln, { size: 10 });
+            y -= 14;
+        });
+        y -= 2;
+    }
+    function table(columns, rows, { size = 9, font = "regular" } = {}) {
+        const totalWeight = columns.reduce((sum, column) => sum + column.weight, 0);
+        const widths = columns.map((column) => CONTENT_W * column.weight / totalWeight);
+        const lineHeight = size + 3;
+        const drawHeader = () => {
+            ensureSpace(40);
+            rect(MARGIN, y - 6, CONTENT_W, 18, "#0b4f6c");
+            let x = MARGIN;
+            columns.forEach((column, index) => {
+                text(x + 5, y, column.label, { font: "bold", size: 8.5, color: "#ffffff" });
+                x += widths[index];
+            });
+            y -= 18;
+        };
+        drawHeader();
+        rows.forEach((row, rowIndex) => {
+            const cellLines = row.map((cell, index) => wrap(cell, font, size, widths[index] - 10));
+            const height = Math.max(...cellLines.map((lines) => lines.length)) * lineHeight + 6;
+            if (y - height < BOTTOM) { newPage(); drawHeader(); }
+            const top = y + lineHeight - 2;
+            rect(MARGIN, top - height, CONTENT_W, height, rowIndex % 2 ? "#f3f7fa" : "#ffffff");
+            line(MARGIN, top - height, MARGIN + CONTENT_W, top - height, "#dbe4ea", 0.4);
+            let x = MARGIN;
+            cellLines.forEach((lines, index) => {
+                lines.forEach((ln, i) => text(x + 5, y - i * lineHeight, ln, { font, size }));
+                x += widths[index];
+            });
+            y -= height;
+        });
+        y -= 10;
+    }
+    function chart(x, top, w, h, title, unit, field, color, threshold) {
+        const samples = reportSamples.filter((sample) => Number.isFinite(sample[field]));
+        rect(x, top - h, w, h, "#fbfdfe", "#c5d2dc");
+        text(x + 8, top - 14, title, { font: "bold", size: 9, color: "#0b4f6c" });
+        text(x + w - 8, top - 14, unit, { size: 7, color: "#6b7c8a", align: "right" });
+        const plot = { left: x + 36, right: x + w - 10, top: top - 24, bottom: top - h + 20 };
+        if (samples.length < 2) {
+            text(x + w / 2, top - h / 2, "Insufficient samples - run the simulation", { size: 8, color: "#6b7c8a", align: "center" });
+            return;
+        }
+        const values = samples.map((sample) => sample[field]);
+        let minV = Math.min(...values, threshold ?? Infinity);
+        let maxV = Math.max(...values, threshold ?? -Infinity);
+        if (maxV - minV < 1e-6) { maxV += 1; minV -= 1; }
+        const padV = (maxV - minV) * 0.1;
+        minV = Math.max(0, minV - padV);
+        maxV += padV;
+        const t0 = samples[0].time, t1 = samples[samples.length - 1].time;
+        const sx = (t) => plot.left + (plot.right - plot.left) * ((t - t0) / Math.max(t1 - t0, 1e-6));
+        const sy = (v) => plot.bottom + (plot.top - plot.bottom) * ((v - minV) / (maxV - minV));
+        for (let i = 0; i <= 4; i++) {
+            const v = minV + (maxV - minV) * i / 4;
+            const gy = sy(v);
+            line(plot.left, gy, plot.right, gy, "#e3eaef", 0.4);
+            text(plot.left - 4, gy - 2.5, v >= 100 ? v.toFixed(0) : v.toFixed(1), { size: 6.5, color: "#6b7c8a", align: "right" });
+        }
+        line(plot.left, plot.bottom, plot.right, plot.bottom, "#8fa3b3", 0.6);
+        line(plot.left, plot.bottom, plot.left, plot.top, "#8fa3b3", 0.6);
+        text(plot.left, plot.bottom - 11, `${t0.toFixed(0)} s`, { size: 6.5, color: "#6b7c8a" });
+        text(plot.right, plot.bottom - 11, `${t1.toFixed(0)} s`, { size: 6.5, color: "#6b7c8a", align: "right" });
+        text((plot.left + plot.right) / 2, plot.bottom - 11, "simulation time", { size: 6.5, color: "#6b7c8a", align: "center" });
+        if (threshold !== null && threshold !== undefined) {
+            line(plot.left, sy(threshold), plot.right, sy(threshold), "#8fa3b3", 0.7, "3 2");
+        }
+        const step = Math.max(1, Math.ceil(samples.length / 400));
+        const path = [];
+        for (let i = 0; i < samples.length; i += step) {
+            path.push(`${sx(samples[i].time).toFixed(2)} ${sy(samples[i][field]).toFixed(2)} ${path.length ? "l" : "m"}`);
+        }
+        ops.push(`${rgb(color)} RG 1 w 1 j ${path.join(" ")} S`);
+    }
+
+    // ---- Cover block ----
+    newPage();
+    rect(0, PAGE_H - 170, PAGE_W, 170, "#071a2c");
+    rect(0, PAGE_H - 174, PAGE_W, 4, "#1b9fc4");
+    text(MARGIN, PAGE_H - 62, "FSOC COARSE ALIGNMENT SYSTEM", { font: "bold", size: 11, color: "#35d8ff" });
+    text(MARGIN, PAGE_H - 92, "Technical Performance Report", { font: "bold", size: 24, color: "#ffffff" });
+    text(MARGIN, PAGE_H - 114, "3D airspace beacon tracking simulation - run summary and measurements", { size: 10, color: "#a9c3d6" });
+    text(MARGIN, PAGE_H - 145, `Report ID: ${reportId}`, { font: "mono", size: 8.5, color: "#a9c3d6" });
+    text(MARGIN + 190, PAGE_H - 145, `Generated: ${now.toLocaleString()}`, { font: "mono", size: 8.5, color: "#a9c3d6" });
+    text(PAGE_W - MARGIN, PAGE_H - 145, `Duration: ${performanceDuration.toFixed(1)} s`, { font: "mono", size: 8.5, color: "#a9c3d6", align: "right" });
+    y = PAGE_H - 205;
+
+    // Key figures strip
+    const keyFigures = [
+        ["DURATION", `${performanceDuration.toFixed(1)} s`],
+        ["MEAN FRAME RATE", fmt(fpsStats?.mean, 1, " FPS")],
+        ["LOCK RETENTION", fmt(lock, 1, " %")],
+        ["MEAN ERROR", fmt(meanError, 2, " px")]
+    ];
+    const cellW = CONTENT_W / keyFigures.length;
+    rect(MARGIN, y - 34, CONTENT_W, 46, "#f3f7fa", "#c5d2dc");
+    keyFigures.forEach(([label, value], index) => {
+        const cx = MARGIN + cellW * index;
+        if (index > 0) line(cx, y - 28, cx, y + 6, "#dbe4ea", 0.6);
+        text(cx + 14, y - 4, label, { font: "bold", size: 7.5, color: "#6b7c8a" });
+        text(cx + 14, y - 22, value, { font: "bold", size: 13, color: "#0b4f6c" });
+    });
+    y -= 62;
+
+    heading(1, "Simulation Overview");
+    paragraph(!hasRun
+        ? "No simulation data had been recorded when this report was generated. Start the simulation and allow it to run to populate the measurements below."
+        : `The 3D airspace simulation ran for ${performanceDuration.toFixed(1)} s with the receiver following the ${autoMode ? `AUTO (${pattern})` : pattern} movement pattern `
+          + `at ${(rxDrone.position.y * METERS_PER_WORLD_UNIT).toFixed(1)} m altitude, ${distanceMeters.toFixed(1)} m from the transmitter, with ${decoyDrones.filter((drone) => drone.visible).length} decoy beacon(s) in the scene. `
+          + `The tracker ran at a mean of ${fmt(fpsStats?.mean, 1, " FPS")} and held lock on the beacon for ${fmt(lock, 1, " %")} of evaluated frames. `
+          + `Mean tracking error was ${fmt(meanError, 2, " px")}${trackedFrames ? ` (peak ${maxTrackingErrorPx.toFixed(2)} px)` : ""}. `
+          + `${mainEvents.length} event(s) were logged during the run, including ${trackingChanges} tracking state change(s) and ${parameterChanges} configuration change(s).`);
+
+    heading(2, "Test Configuration");
+    table(
+        [{ label: "PARAMETER", weight: 1 }, { label: "VALUE", weight: 1.6 }],
+        [
+            ["Movement pattern", autoMode ? `AUTO (current: ${pattern})` : pattern],
+            ["Beacon visibility", beaconHidden ? "Hidden (prediction only)" : "Visible"],
+            ["Visible decoy beacons", String(decoyDrones.filter((drone) => drone.visible).length)],
+            ["Environmental disturbances", Object.entries(disturbanceLevels).map(([name, value]) => `${name}: ${value}/4`).join(", ")],
+            ["RX altitude", `${(rxDrone.position.y * METERS_PER_WORLD_UNIT).toFixed(1)} m`],
+            ["TX/RX separation", `${distanceMeters.toFixed(1)} m`],
+            ["Final tracking state", trackingStatus?.textContent?.trim() || "UNKNOWN"],
+            ["Performance samples recorded", `${reportSamples.length} (every 0.5 s)`],
+            ["Frames evaluated", String(trackedFrames)]
+        ]
+    );
+
+    heading(3, "Performance Metrics");
+    paragraph("Measured values for the run. The reference column lists the corresponding figures from the supplied evaluation criteria for context.", { size: 9, color: "#4a5b68" });
+    table(
+        [{ label: "METRIC", weight: 1.3 }, { label: "MEASURED", weight: 1.1 }, { label: "REFERENCE", weight: 1.2 }],
+        metricRows
+    );
+
+    heading(4, "Time-Series Analysis");
+    paragraph("Dashed lines mark the reference values.", { size: 9, color: "#4a5b68" });
+    const chartW = (CONTENT_W - 14) / 2, chartH = 160;
+    ensureSpace(chartH * 2 + 20);
+    chart(MARGIN, y, chartW, chartH, "FRAME RATE", "FPS", "fps", "#1b9fc4", REPORT_REQUIREMENTS.fps);
+    chart(MARGIN + chartW + 14, y, chartW, chartH, "TRACKING ERROR", "pixels", "error", "#e0603f", null);
+    y -= chartH + 12;
+    chart(MARGIN, y, chartW, chartH, "LOCK RETENTION", "%", "lock", "#138a52", REPORT_REQUIREMENTS.lock);
+    chart(MARGIN + chartW + 14, y, chartW, chartH, "PROCESSING TIME", "ms / frame", "processing", "#7a5cd6", REPORT_REQUIREMENTS.processingMs);
+    y -= chartH + 20;
+    table(
+        [{ label: "SERIES", weight: 1.3 }, { label: "MIN", weight: 1 }, { label: "MEAN", weight: 1 }, { label: "MAX", weight: 1 }],
+        [
+            ["Frame rate (FPS)", fpsStats, 1],
+            ["Tracking error (px)", errorStats, 2],
+            ["Lock retention (%)", lockStats, 1],
+            ["Processing time (ms)", processingStats, 2]
+        ].map(([name, stats, digits]) => [name, fmt(stats?.min, digits, ""), fmt(stats?.mean, digits, ""), fmt(stats?.max, digits, "")])
+    );
+
+    heading(5, "Event Log");
+    paragraph(`${mainEvents.length} event(s) recorded. The ${sampleCount} periodic telemetry samples are summarised in Sections 3 and 4 rather than listed here.${mainEvents.length > 400 ? " The most recent 400 events are shown." : ""}`, { size: 9, color: "#4a5b68" });
+    if (mainEvents.length) {
+        table(
+            [{ label: "TIME", weight: 0.75 }, { label: "EVENT", weight: 1.15 }, { label: "DETAILS", weight: 3.4 }],
+            mainEvents.slice(-400).map((entry) => [entry.time, reportEventName(entry.event), entry.details]),
+            { size: 8 }
+        );
+    } else {
+        paragraph("No events recorded.", { size: 9, color: "#6b7c8a" });
+    }
+
+    heading(6, "Observations");
+    const observations = [];
+    if (!hasRun) {
+        observations.push("No run data is available yet.");
+    } else {
+        if (fpsStats) observations.push(`Frame rate ranged from ${fpsStats.min.toFixed(1)} to ${fpsStats.max.toFixed(1)} FPS across ${reportSamples.length} samples.`);
+        if (lock !== null) observations.push(`The beacon was held in lock for ${lock.toFixed(1)} % of ${trackedFrames} evaluated frames.`);
+        if (acquisitionTime !== null) observations.push(`Initial acquisition took ${acquisitionTime.toFixed(2)} s${reacquisitionTime !== null ? `; the most recent re-acquisition took ${reacquisitionTime.toFixed(2)} s` : ""}.`);
+        if (errorStats) observations.push(`Tracking error averaged ${errorStats.mean.toFixed(2)} px over the sampled period, between ${errorStats.min.toFixed(2)} and ${errorStats.max.toFixed(2)} px.`);
+        if (processingStats) observations.push(`Per-frame processing averaged ${processingStats.mean.toFixed(2)} ms.`);
+        const activeDisturbances = Object.entries(disturbanceLevels).filter(([, value]) => value > 0);
+        observations.push(activeDisturbances.length
+            ? `Active disturbances at report time: ${activeDisturbances.map(([name, value]) => `${name} ${value}/4`).join(", ")}.`
+            : "No environmental disturbances were active at report time.");
+    }
+    observations.forEach(bullet);
+
+    // ---- Page furniture ----
+    pages.forEach((pageOps, index) => {
+        ops = pageOps;
+        if (index > 0) {
+            text(MARGIN, PAGE_H - 38, "FSOC Coarse Alignment - Technical Performance Report", { size: 8, color: "#6b7c8a" });
+            text(PAGE_W - MARGIN, PAGE_H - 38, reportId, { font: "mono", size: 8, color: "#6b7c8a", align: "right" });
+            line(MARGIN, PAGE_H - 45, PAGE_W - MARGIN, PAGE_H - 45, "#c5d2dc", 0.5);
+        }
+        line(MARGIN, 42, PAGE_W - MARGIN, 42, "#c5d2dc", 0.5);
+        text(MARGIN, 30, "Generated by FSOC Optical Link Control Center (simulation mode)", { size: 7.5, color: "#6b7c8a" });
+        text(PAGE_W - MARGIN, 30, `Page ${index + 1} of ${pages.length}`, { size: 7.5, color: "#6b7c8a", align: "right" });
+    });
+
+    // ---- Serialize (all content is ASCII, so string length == byte length) ----
+    const objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        null,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>",
+        `<< /Title (${esc(`FSOC Technical Performance Report ${reportId}`)}) /Producer (FSOC Control Center) >>`
+    ];
+    const pageRefs = [];
+    pages.forEach((pageOps) => {
+        const stream = pageOps.join("\n");
+        const pageId = objects.length + 1;
+        objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PAGE_W} ${PAGE_H}] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents ${pageId + 1} 0 R >>`);
+        objects.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
+        pageRefs.push(`${pageId} 0 R`);
+    });
+    objects[1] = `<< /Type /Pages /Kids [${pageRefs.join(" ")}] /Count ${pageRefs.length} >>`;
+    let pdf = "%PDF-1.4\n";
+    const offsets = [];
+    objects.forEach((body, index) => {
+        offsets.push(pdf.length);
+        pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
+    });
+    const xrefOffset = pdf.length;
+    pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    offsets.forEach((offset) => { pdf += `${String(offset).padStart(10, "0")} 00000 n \n`; });
+    pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R /Info 6 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+    return { pdf, fileName: `fsoc-technical-report-${reportId.slice(5)}.pdf` };
+}
+
+const reportToast = document.getElementById("report-toast");
+let reportToastTimer = null;
+let reportConfirmTimer = null;
+
+function showReportToast(title, detail, isError = false) {
+    if (!reportToast) return;
+    document.getElementById("report-toast-title").textContent = title;
+    document.getElementById("report-toast-detail").textContent = detail;
+    reportToast.classList.toggle("is-error", isError);
+    reportToast.querySelector(".report-toast-icon").textContent = isError ? "!" : "✓";
+    reportToast.hidden = false;
+    clearTimeout(reportToastTimer);
+    reportToastTimer = setTimeout(() => { reportToast.hidden = true; }, isError ? 7000 : 5000);
+}
+
+// Called by the Qt host (main.py) once the download has been written to disk.
+window.fsocReportDownloaded = (path, ok) => {
+    clearTimeout(reportConfirmTimer);
+    if (ok) {
+        showReportToast("REPORT DOWNLOADED", `Opening ${path.split(/[\\/]/).pop()} (saved in Downloads)`);
+        recordActivity("REPORT", `Technical report saved to ${path}`);
+    } else {
+        showReportToast("DOWNLOAD FAILED", "The report could not be saved. Check disk space and folder permissions.", true);
+    }
+};
+
+function downloadPerformanceReport() {
+    updatePerformanceSummary();
+    let result;
+    try {
+        result = buildTechnicalReportPdf();
+    } catch (error) {
+        console.error(error);
+        showReportToast("REPORT FAILED", error?.message || String(error), true);
+        return;
+    }
+    const url = URL.createObjectURL(new Blob([result.pdf], { type: "application/pdf" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = result.fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+    if (/QtWebEngine/i.test(navigator.userAgent)) {
+        // The Qt host confirms with the saved path; flag it if it never does.
+        clearTimeout(reportConfirmTimer);
+        reportConfirmTimer = setTimeout(() => {
+            showReportToast("DOWNLOAD NOT CONFIRMED", `${result.fileName} may not have been saved.`, true);
+        }, 10000);
+    } else {
+        showReportToast("REPORT DOWNLOADED", `${result.fileName} saved to your Downloads folder`);
+        recordActivity("REPORT", `Technical report ${result.fileName} downloaded`);
+    }
+}
+
+reportButton?.addEventListener("click", downloadPerformanceReport);
+
+function updatePerformanceSummary() {
+    const averageError = trackedFrames
+        ? totalTrackingErrorPx / trackedFrames
+        : null;
+    const lockRetention = trackedFrames
+        ? lockedFrames / trackedFrames * 100
+        : null;
+    const values = {
+        "metric-duration": `${performanceDuration.toFixed(1)} s`,
+        "metric-fps": currentFrameRate > 0
+            ? `${currentFrameRate.toFixed(1)} FPS`
+            : "-- FPS",
+        "metric-acquisition": acquisitionTime === null
+            ? "-- s"
+            : `${acquisitionTime.toFixed(2)} s`,
+        "metric-reacquisition": reacquisitionTime === null
+            ? "-- s"
+            : `${reacquisitionTime.toFixed(2)} s`,
+        "metric-mean-error": averageError === null
+            ? "-- px"
+            : `${averageError.toFixed(2)} px`,
+        "metric-max-error": trackedFrames
+            ? `${maxTrackingErrorPx.toFixed(2)} px`
+            : "-- px",
+        "metric-lock-retention": lockRetention === null
+            ? "--%"
+            : `${lockRetention.toFixed(1)}%`,
+        "metric-processing": performanceDuration > 0
+            ? `${currentProcessingMs.toFixed(2)} ms`
+            : "-- ms"
+    };
+
+    Object.entries(values).forEach(([id, value]) => {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value;
+    });
+}
+
+function drawPerformanceChart(canvasId, field, color, options = {}) {
+    const chart = document.getElementById(canvasId);
+    const context = chart?.getContext("2d");
+    if (!chart || !context) return;
+
+    const width = chart.clientWidth || 600;
+    const height = chart.clientHeight || 150;
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    chart.width = Math.round(width * pixelRatio);
+    chart.height = Math.round(height * pixelRatio);
+    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    context.clearRect(0, 0, width, height);
+
+    const margin = { left: 42, right: 12, top: 10, bottom: 24 };
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const values = performanceSamples
+        .map((sample) => sample[field])
+        .filter(Number.isFinite);
+    const maxValue = options.max ?? Math.max(
+        options.minimumMax || 1,
+        ...values.map((value) => value * 1.15)
+    );
+
+    context.font = "10px Arial, sans-serif";
+    context.lineWidth = 1;
+    for (let tick = 0; tick <= 4; tick++) {
+        const ratio = tick / 4;
+        const y = margin.top + plotHeight * ratio;
+        context.strokeStyle = "rgba(113, 144, 173, 0.18)";
+        context.beginPath();
+        context.moveTo(margin.left, y);
+        context.lineTo(width - margin.right, y);
+        context.stroke();
+        context.fillStyle = "#7190ad";
+        context.textAlign = "right";
+        context.fillText((maxValue * (1 - ratio)).toFixed(0), margin.left - 7, y + 3);
+    }
+
+    const yFor = (value) =>
+        margin.top + plotHeight * (1 - THREE.MathUtils.clamp(value / maxValue, 0, 1));
+
+    if (Number.isFinite(options.threshold)) {
+        const thresholdY = yFor(options.threshold);
+        context.save();
+        context.setLineDash([5, 4]);
+        context.strokeStyle = "rgba(255, 200, 87, 0.8)";
+        context.beginPath();
+        context.moveTo(margin.left, thresholdY);
+        context.lineTo(width - margin.right, thresholdY);
+        context.stroke();
+        context.restore();
+    }
+
+    if (performanceSamples.length === 0) {
+        context.fillStyle = "#7190ad";
+        context.textAlign = "center";
+        context.fillText("Start simulation to collect live data", width / 2, height / 2);
+    } else {
+        context.strokeStyle = color;
+        context.lineWidth = 2;
+        context.lineJoin = "round";
+        context.beginPath();
+        performanceSamples.forEach((sample, index) => {
+            const x = margin.left + (performanceSamples.length > 1
+                ? plotWidth * index / (performanceSamples.length - 1)
+                : plotWidth);
+            const y = yFor(sample[field]);
+            if (index === 0) context.moveTo(x, y);
+            else context.lineTo(x, y);
+        });
+        context.stroke();
+    }
+
+    const firstTime = performanceSamples[0]?.time ?? 0;
+    const lastTime = performanceSamples[performanceSamples.length - 1]?.time ?? 0;
+    context.fillStyle = "#7190ad";
+    context.textAlign = "left";
+    context.fillText(`-${Math.max(0, lastTime - firstTime).toFixed(0)} s`, margin.left, height - 5);
+    context.textAlign = "right";
+    context.fillText("now", width - margin.right, height - 5);
+}
+
+function drawPerformanceDashboard() {
+    updatePerformanceSummary();
+    drawPerformanceChart("chart-fps", "fps", "#35d8ff", {
+        minimumMax: 35,
+        threshold: 30
+    });
+    drawPerformanceChart("chart-error", "error", "#ff8b74", {
+        minimumMax: 10
+    });
+    drawPerformanceChart("chart-lock", "lock", "#42f5a7", {
+        max: 100,
+        threshold: 95
+    });
+    drawPerformanceChart("chart-processing", "processing", "#b59aff", {
+        minimumMax: 5
+    });
+}
+
+function samplePerformance() {
+    const lockRetention = trackedFrames
+        ? lockedFrames / trackedFrames * 100
+        : 0;
+    performanceSamples.push({
+        time: performanceDuration,
+        fps: currentFrameRate,
+        error: currentTrackingErrorPx,
+        lock: lockRetention,
+        processing: currentProcessingMs
+    });
+    if (performanceSamples.length > MAX_PERFORMANCE_SAMPLES) {
+        performanceSamples.shift();
+    }
+    reportSamples.push(performanceSamples[performanceSamples.length - 1]);
+    if (reportSamples.length > MAX_REPORT_SAMPLES) reportSamples.splice(0, reportSamples.length - MAX_REPORT_SAMPLES);
+    updatePerformanceSummary();
+    if (performanceModal && !performanceModal.hidden) {
+        drawPerformanceDashboard();
+    }
+}
+
+function closePerformanceModal() {
+    if (!performanceModal) return;
+    performanceModal.hidden = true;
+    performanceButton?.focus();
+}
+
+performanceButton?.addEventListener("click", () => {
+    if (!performanceModal) return;
+    performanceModal.hidden = false;
+    drawPerformanceDashboard();
+    performanceCloseButton?.focus();
+});
+performanceCloseButton?.addEventListener("click", closePerformanceModal);
+performanceModal?.addEventListener("click", (event) => {
+    if (event.target === performanceModal) closePerformanceModal();
+});
+document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && performanceModal && !performanceModal.hidden) {
+        closePerformanceModal();
+    }
+});
 
 function setBeaconHidden(hidden) {
     beaconHidden = Boolean(hidden);
@@ -931,6 +1669,7 @@ function setBeaconHidden(hidden) {
     if (terminalBeacon) {
         terminalBeacon.classList.toggle("beacon-offscreen", beaconHidden);
     }
+    recordActivity("BEACON", beaconHidden ? "Beacon hidden; receiver path remains active" : "Beacon visible; tracking can reacquire target");
 }
 
 // ============================================================
@@ -1080,6 +1819,13 @@ function updateBeaconTracking(deltaTime, elapsed) {
     // receiver centered and makes its selected movement pattern look static.
 
     const recentlyTracked = trackingLostTime < 0.25;
+    currentTrackingErrorPx = error * 0.3;
+    if (running) {
+        trackedFrames++;
+        totalTrackingErrorPx += currentTrackingErrorPx;
+        maxTrackingErrorPx = Math.max(maxTrackingErrorPx, currentTrackingErrorPx);
+        if (detected || recentlyTracked) lockedFrames++;
+    }
 
     const source = detected || recentlyTracked
         ? severity < 4 ? "YOLO"
@@ -1161,12 +1907,14 @@ function updateBeaconTracking(deltaTime, elapsed) {
 if (startButton) {
     startButton.addEventListener("click", () => {
         running = true;
+        recordActivity("SIMULATION", "Simulation started");
     });
 }
 
 if (pauseButton) {
     pauseButton.addEventListener("click", () => {
         running = false;
+        recordActivity("SIMULATION", "Simulation paused");
     });
 }
 
@@ -1184,12 +1932,30 @@ function resetSimulation() {
     acquisitionTime = null;
     reacquisitionTime = null;
     reacquisitionStarted = null;
+    performanceDuration = 0;
+    performanceSampleClock = 0;
+    performanceSamples = [];
+    reportSamples = [];
+    currentFrameRate = 0;
+    currentProcessingMs = 0;
+    currentTrackingErrorPx = 0;
+    totalTrackingErrorPx = 0;
+    maxTrackingErrorPx = 0;
+    trackedFrames = 0;
+    lockedFrames = 0;
+    updatePerformanceSummary();
+    if (performanceModal && !performanceModal.hidden) {
+        drawPerformanceDashboard();
+    }
     rxDrone.rotation.y = 0;
     simulationTime = 0;
-    transitioning = false;
+    patternTransition = null;
+    receiverVelocity.set(0, 0, 0);
+    previousReceiverPosition.copy(rxDrone.position);
     randomTargetValid = false;
     clearTrail();
     updateBeam(0);
+    recordActivity("SIMULATION", "Simulation reset; performance counters cleared");
 }
 
 if (resetButton) {
@@ -1204,18 +1970,13 @@ function setPattern(value) {
     autoMode = selected === "auto";
     pattern = autoMode ? chooseAutoPattern() : selected;
     autoSwitchRemaining = 8 + Math.random() * 5;
-    transitioning = false;
-    simulationTime = 0;
-    randomTargetValid = false;
-    if (pattern !== "random") {
-        rxDrone.position.x = 0;
-        rxDrone.position.z = 0;
-    }
+    beginPatternTransition();
 
     if (patternSelect && patternSelect.value !== selected) {
         patternSelect.value = selected;
     }
     clearTrail();
+    recordActivity("PATTERN", `Receiver movement pattern changed to ${autoMode ? `AUTO (starting ${pattern})` : pattern}`);
 }
 
 if (patternSelect) {
@@ -1231,6 +1992,7 @@ function setDecoyCount(value) {
     });
     if (decoyCountSlider) decoyCountSlider.value = String(count);
     if (decoyCountValue) decoyCountValue.textContent = String(count);
+    recordActivity("PARAMETER", `Visible decoy beacon count set to ${count}`);
 }
 
 if (decoyCountSlider) {
@@ -1313,10 +2075,9 @@ window.fsoc = {
 
 let previousTime = performance.now() / 1000;
 let elapsedTime = 0;
-const cameraFollowDelta = new THREE.Vector3();
-
 function animate(now) {
     requestAnimationFrame(animate);
+    const frameStartedAt = performance.now();
 
     const currentTime = now / 1000;
     const deltaTime = Math.min(
@@ -1328,13 +2089,24 @@ function animate(now) {
     elapsedTime += deltaTime;
 
     if (running) {
-        if (transitioning) {
-            transitionToOrigin(deltaTime);
-        } else {
-            updatePattern(deltaTime);
-            updateTrail();
+        performanceDuration += deltaTime;
+        updatePattern(deltaTime);
+        updateTrail();
+        activitySampleClock += deltaTime;
+        if (activitySampleClock >= 1) {
+            activitySampleClock %= 1;
+            sampleBeaconActivity();
         }
     }
+
+    if (deltaTime > 1e-5) {
+        receiverVelocity.copy(rxDrone.position)
+            .sub(previousReceiverPosition)
+            .divideScalar(deltaTime);
+    } else {
+        receiverVelocity.set(0, 0, 0);
+    }
+    previousReceiverPosition.copy(rxDrone.position);
 
     const pulse = 1 + Math.sin(elapsedTime * 3) * 0.12;
     ring1.scale.setScalar(pulse);
@@ -1354,14 +2126,27 @@ function animate(now) {
 
     updateBeaconTracking(deltaTime, elapsedTime);
     updateBeam(elapsedTime);
-    // Move the camera and orbit center together so manual rotation/zoom stays intact.
-    cameraFollowDelta.copy(rxDrone.position).sub(controls.target);
-    controls.target.add(cameraFollowDelta);
-    camera.position.add(cameraFollowDelta);
-    controls.update();
-
     renderer.render(scene, camera);
     drawAircraftOverlay();
+
+    currentProcessingMs = performance.now() - frameStartedAt;
+    if (deltaTime > 1e-5) {
+        const instantaneousFps = 1 / deltaTime;
+        currentFrameRate = currentFrameRate === 0
+            ? instantaneousFps
+            : currentFrameRate * 0.85 + instantaneousFps * 0.15;
+    }
+    if (fpsDisplay && currentFrameRate > 0) {
+        fpsDisplay.textContent = String(Math.round(currentFrameRate));
+    }
+
+    if (running) {
+        performanceSampleClock += deltaTime;
+        if (performanceSampleClock >= 0.5) {
+            performanceSampleClock %= 0.5;
+            samplePerformance();
+        }
+    }
 }
 
 // Initial camera and render

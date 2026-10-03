@@ -3,8 +3,8 @@ from vision.yolo_detector import YoloBeaconDetector  # must load before PyQt5
 import sys
 import cv2
 import math
-import random
 import numpy as np
+import time
 
 from PyQt5.QtWidgets import (
     QApplication,
@@ -17,27 +17,27 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QSlider,
     QSizePolicy,
-    QFrame,
+    QFileDialog,
+    QMessageBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QDialog,
 )
 
-from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QDesktopServices, QImage, QPixmap
+from PyQt5.QtCore import QTimer, Qt, QUrl
 
-from sim.scene import VirtualScene
-from sim.virtual_camera import VirtualPTZCamera
-from sim.overlay import draw_crosshair
+import os
+from datetime import datetime
 
-from vision.classical_detector import (
-    detect_beacon_classical,
-    score_candidate,
+from ui.video_report import write_video_benchmark_report
+from vision.video_tracker import (
+    BenchmarkMetrics, VideoBeaconTracker, find_ground_truth, load_ground_truth,
 )
-
-from vision.fusion import fuse_detection
-from vision.preprocess import denoise_for_detection
-from control.ptz_controller import compute_delta
-from vision.kalman_tracker import BeaconKalmanTracker
-from disturbance.manager import DisturbanceManager
-from logging_.logger import PerformanceLogger
+from sim.scenario import ATMOSPHERES, PLATFORM_MOTIONS, ScenarioConfig, ScenarioRunner, apply_disturbances
+from ui.scenario_dialog import ScenarioDialog
+from ui.scenario_report import export_scenario_outputs
 
 
 class Dashboard(QWidget):
@@ -73,96 +73,39 @@ class Dashboard(QWidget):
         # PIPELINE SETUP
         # ==========================================================
 
-        self.scene = VirtualScene(pattern="circular", n_decoys=4)
+        # Benchmark-1 scenario engine: virtual PTZ camera over a large screen
+        # (sim/scenario.py). A fresh ScenarioRunner is built on RESET / START.
+        self.scenario_config = ScenarioConfig()
+        self.runner = None
 
-        _, start_pos = self.scene.render()
-
-        self.camera = VirtualPTZCamera()
-
-        self.camera.pan_x = start_pos[0]
-        self.camera.tilt_y = start_pos[1]
-
-        self.screen_center = (self.camera.fov_w // 2, self.camera.fov_h // 2)
-
-        # YOLO detector
+        # YOLO detector: AI assistance for acquisition (runs on a worker thread)
         self.detector = YoloBeaconDetector(
             weights_path="beacon_yolo.pt", conf_threshold=0.25
         )
-
-        # Kalman tracker
-        self.tracker = BeaconKalmanTracker(init_offset=(0, 0), max_coast_frames=None)
-
-        # Disturbances
-        self.disturbance_mgr = DisturbanceManager()
-
-        # Performance logging
-        self.logger = PerformanceLogger()
+        # The first inference takes seconds (model set-up, mostly Python). Do it
+        # at start-up so it never competes with the 30 Hz loop later.
+        try:
+            self.detector.detect(np.zeros((320, 320, 3), np.uint8))
+        except Exception:
+            pass
+        self._yolo_warm = True
 
         self.frame_count = 0
-        self.tracking_elapsed = 0.0
         self.acquisition_time = None
         self.reacquisition_time = None
-        self.reacquisition_started = None
-        self.was_locked = False
-
-        # Run detector every frame so the PTZ loop never deliberately
-        # skips a target update while the beacon is moving.
-        self.DETECT_EVERY_N = 1
-
-        self.last_source = "kalman"
+        self.screen_center = (320, 240)
 
         # ==========================================================
         # SIMULATION CONTROLS
         # ==========================================================
 
         self.running = False
+        self.media_capture = None
+        self.media_path = None
 
-        # Intentional beacon occlusion / Kalman prediction test.
-        # When True, the beacon is hidden from the optical detector,
-        # while the simulated target continues moving normally.
+        # HIDE BEACON: the target keeps moving but is not drawn.
         self.beacon_hidden = False
-
-        # ----------------------------------------------------------
-        # KALMAN REACQUISITION / TARGET SNAP
-        # ----------------------------------------------------------
-        # When SHOW BEACON is pressed after a hidden interval, the
-        # simulated beacon is visually/optically reintroduced exactly
-        # at the latest Kalman-predicted WORLD position.  We then keep
-        # the simulator trajectory offset by the same amount so the
-        # beacon does not jump back to its old ground-truth position.
-        self.kalman_prediction_world = None
-        self.reacquire_offset = None
-        self.reacquire_active = False
-        self.reacquire_target_world = None
-
-        # Simulator ground-truth is used ONLY as a recovery/coarse
-        # acquisition signal when the optical detector is blinded by
-        # severe disturbances or when the beacon leaves the FOV.
-        self.sim_assist_active = False
-
-        self.target_visible_in_fov = False
-
-        self.last_measurement_frame = -1
-
-        # ==========================================================
-        # REACQUISITION STATE
-        # ==========================================================
-
-        self.search_state = "LOCKED"
-
-        self.last_known_world_pos = (
-            float(self.camera.pan_x),
-            float(self.camera.tilt_y),
-        )
-
-        self.search_angle = 0.0
-        self.search_radius = 0.0
-        self.enlarge_radius = 0.0
-
-        self.ENLARGE_MAX_RADIUS = 140.0
-        self.SPIRAL_MAX_RADIUS = 100.0
-
-        self.roam_target = None
+        self.search_state = "READY"
 
         # ==========================================================
         # TELEMETRY VARIABLES
@@ -176,6 +119,12 @@ class Dashboard(QWidget):
         self.current_distance = None
 
         self.current_source = "kalman"
+        self.current_processing_ms = 0.0
+        self.current_fps = 0.0
+        self.activity_log = []
+        self.activity_sample_elapsed = 0.0
+        self.activity_previous_state = None
+        self._reset_report_session()
 
         # ==========================================================
         # STABLE DISPLAY TELEMETRY
@@ -199,11 +148,19 @@ class Dashboard(QWidget):
         # TIMER
         # ==========================================================
 
+        # Frame loop: a single-shot precise timer re-armed against an absolute
+        # deadline every 1 / rate s (see _tick), so timer lateness is made up on
+        # the next frame instead of permanently lowering the frame rate.
         self.timer = QTimer()
+        self.timer.setTimerType(Qt.PreciseTimer)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self._tick)
+        self.loop_rate_hz = self.scenario_config.update_rate_hz
+        self._next_deadline = None
 
-        self.timer.timeout.connect(self.update_frame)
-
-        self.timer.setInterval(30)
+        self._sync_controls_from_config()
+        self._new_runner()
+        QTimer.singleShot(0, lambda: self._draw_scenario_views(preview=True))
 
         self.system_status.setText(
             "● SYSTEM READY   |   SIMULATION PAUSED   |   PRESS START"
@@ -230,6 +187,9 @@ class Dashboard(QWidget):
         self.system_status = QLabel("● SYSTEM INITIALIZING")
 
         self.system_status.setObjectName("systemStatus")
+        # Text changes every frame; ignoring its size hint stops each update
+        # from triggering a relayout / full-window repaint.
+        self.system_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
 
         # ----------------------------------------------------------
         # FULL SCENE VIEW
@@ -237,8 +197,10 @@ class Dashboard(QWidget):
 
         self.full_scene_label = QLabel()
 
+        # Size comes from the layout stretch only, not from the pixmap it shows,
+        # so replacing the pixmap every frame never re-runs the layout.
         self.full_scene_label.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Expanding
+            QSizePolicy.Ignored, QSizePolicy.Ignored
         )
 
         self.full_scene_label.setMinimumSize(480, 300)
@@ -255,11 +217,9 @@ class Dashboard(QWidget):
 
         self.pat_panel.setMinimumWidth(0)
 
-        # Compact fixed height.
-        # This prevents telemetry from consuming the whole right side.
-        self.pat_panel.setMinimumHeight(0)
-
-        self.pat_panel.setMaximumHeight(250)
+        # Reserve enough room for every telemetry row at the larger font.
+        self.pat_panel.setMinimumHeight(450)
+        self.pat_panel.setMaximumHeight(480)
 
         self.pat_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -279,9 +239,11 @@ class Dashboard(QWidget):
 
         self.boresight_label.setAlignment(Qt.AlignCenter)
 
-        self.boresight_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.boresight_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
-        self.boresight_label.setMinimumSize(420, 270)
+        # Give the telemetry panel the vertical space it needs; the camera
+        # preview can shrink while remaining large enough to inspect.
+        self.boresight_label.setMinimumSize(360, 170)
 
         self.boresight_label.setObjectName("boresightPanel")
 
@@ -363,7 +325,7 @@ class Dashboard(QWidget):
                 border-radius: 1px;
                 padding: 5px 8px;
                 font-family: Consolas, monospace;
-                font-size: 9px;
+                font-size: 11px;
                 font-weight: bold;
             }
 
@@ -441,6 +403,15 @@ class Dashboard(QWidget):
                 background: #28d7b0;
                 border-radius: 6px;
             }
+
+            QToolTip {
+                background-color: #0f2233;
+                color: #e6f6ff;
+                border: 1px solid #28d7b0;
+                padding: 6px;
+                font-family: Consolas;
+                font-size: 12px;
+            }
         """)
 
     # ==============================================================
@@ -460,14 +431,51 @@ class Dashboard(QWidget):
         self.pause_button = QPushButton("PAUSE")
 
         self.reset_button = QPushButton("RESET")
+        self.load_media_button = QPushButton("UPLOAD VIDEO")
+        self.ground_truth_button = QPushButton("LOAD GROUND TRUTH")
+        self.scenario_button = QPushButton("SCENARIO...")
+        self.report_button = QPushButton("GENERATE REPORT")
+        self.activity_button = QPushButton("ACTIVITY LOG")
 
         self.hide_button = QPushButton("HIDE BEACON")
+
+        tips = {
+            self.start_button: "Start (or resume) the simulation, or play the uploaded video.",
+            self.pause_button: "Pause. START continues from the same point.",
+            self.reset_button: "Stop and start a fresh scenario run (back to simulation mode "
+                               "if a video was loaded).",
+            self.scenario_button: "Open every scenario setting (camera, target, motion, noise, "
+                                  "atmosphere, duration...) and save / load scenario files.",
+            self.load_media_button: "Use a video file as the camera input instead of the simulation "
+                                    "(Benchmark 2). The camera movement is bypassed.",
+            self.ground_truth_button: (
+                "<b>Video mode only.</b> Load a file with the <i>true</i> beacon position for each "
+                "frame of the uploaded video (one row per frame: frame, x, y).<br><br>"
+                "With it, the app compares its own measured beacon positions against the truth and "
+                "reports the centroiding error and RMSE (how many pixels off it was).<br><br>"
+                "Without it, the measured positions are still saved so they can be checked later.<br>"
+                "A file named <i>&lt;video name&gt;_gt.csv</i> next to the video is loaded "
+                "automatically, so you usually don't need this button."
+            ),
+            self.report_button: "Save the performance logs (per-frame CSV, summary) and the PDF "
+                                "report to Downloads\\fsoc-benchmark, and open the report.",
+            self.activity_button: "Show everything that has happened in this session.",
+            self.hide_button: "Hide the beacon (it keeps moving) to test how the tracker coasts "
+                              "and re-acquires it.",
+        }
+        for button, tip in tips.items():
+            button.setToolTip(tip)
 
         self.start_button.clicked.connect(self._start_simulation)
 
         self.pause_button.clicked.connect(self._pause_simulation)
 
         self.reset_button.clicked.connect(self._reset_simulation)
+        self.load_media_button.clicked.connect(self._load_media)
+        self.ground_truth_button.clicked.connect(self._load_ground_truth)
+        self.scenario_button.clicked.connect(self._open_scenario_dialog)
+        self.report_button.clicked.connect(self._export_report_pdf)
+        self.activity_button.clicked.connect(self._show_activity_log)
 
         self.hide_button.clicked.connect(self._toggle_beacon_visibility)
 
@@ -476,6 +484,11 @@ class Dashboard(QWidget):
         row.addWidget(self.pause_button)
 
         row.addWidget(self.reset_button)
+        row.addWidget(self.scenario_button)
+        row.addWidget(self.load_media_button)
+        row.addWidget(self.ground_truth_button)
+        row.addWidget(self.report_button)
+        row.addWidget(self.activity_button)
 
         row.addWidget(self.hide_button)
 
@@ -490,10 +503,10 @@ class Dashboard(QWidget):
         self.pattern_combo = QComboBox()
 
         self.pattern_combo.addItems(
-            ["Auto", "circular", "figure8", "straight", "random"]
+            ["Auto", "straight", "circular", "figure8", "random", "spiral", "sinusoidal"]
         )
 
-        self.pattern_combo.setCurrentText("circular")
+        self.pattern_combo.setCurrentText(self.scenario_config.motion)
 
         self.pattern_combo.currentTextChanged.connect(self._on_pattern_changed)
 
@@ -511,274 +524,866 @@ class Dashboard(QWidget):
 
         self.decoy_slider.setMaximum(10)
 
-        self.decoy_slider.setValue(self.scene.n_decoys)
+        self.decoy_slider.setValue(self.scenario_config.decoys)
 
         self.decoy_slider.valueChanged.connect(self._on_decoy_count_changed)
 
         row.addWidget(self.decoy_slider)
 
-        self.decoy_count_label = QLabel(str(self.scene.n_decoys))
+        self.decoy_count_label = QLabel(str(self.scenario_config.decoys))
 
         row.addWidget(self.decoy_count_label)
 
         return row
 
     def _start_simulation(self):
+        if self.media_path:
+            if self.media_capture is None:
+                # Replaying a finished clip: start a fresh measurement session so
+                # frame numbers line up with the ground truth again.
+                truth_path = self.video_info.get("ground_truth")
+                if not self._open_video(self.media_path, autostart=False):
+                    return
+                if truth_path and self.video_metrics.ground_truth is None:
+                    self._apply_ground_truth(truth_path, announce=False)
+            if self.media_capture is not None and self.media_capture.isOpened():
+                self.running = True
+                self._start_loop()
+                self._record_activity("SIMULATION", "Uploaded video playback started")
+                self.system_status.setText("● VIDEO PLAYING   |   BEACON DETECTION ACTIVE")
+            return
         if not self.running:
+            if self.runner is None or self.runner.finished():
+                self._new_runner()
+            self.loop_rate_hz = self.runner.cfg.update_rate_hz
             self.running = True
-            self.timer.start()
-            self.system_status.setText("● SYSTEM ONLINE   |   SIMULATION RUNNING")
+            self._last_tick = None
+            self._start_loop()
+            self._record_activity("SIMULATION", "Scenario running")
 
     def _pause_simulation(self):
         self.running = False
         self.timer.stop()
+        self._record_activity("SIMULATION", "Simulation paused")
         self.system_status.setText("● SYSTEM PAUSED   |   PRESS START TO RESUME")
 
-    def _relocate_rendered_beacon(self, frame, old_pos, new_pos):
-        img = frame.copy()
-        ox, oy = int(round(old_pos[0])), int(round(old_pos[1]))
-        nx, ny = int(round(new_pos[0])), int(round(new_pos[1]))
-        radius = 28
-
-        h, w = img.shape[:2]
-        x0, x1 = max(0, ox - radius), min(w, ox + radius + 1)
-        y0, y1 = max(0, oy - radius), min(h, oy + radius + 1)
-
-        patch = img[y0:y1, x0:x1].copy()
-        if patch.size == 0:
-            return img
-
-        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        beacon_mask = cv2.inRange(
-            hsv,
-            np.array([0, 0, 150], dtype=np.uint8),
-            np.array([180, 110, 255], dtype=np.uint8),
+    def _load_media(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select a video", "",
+            "Video files (*.mp4 *.avi *.mov *.mkv *.m4v *.wmv *.webm)",
         )
-        beacon_mask = cv2.morphologyEx(
-            beacon_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+        if not path:
+            return
+        self._open_video(path)
+
+    def _open_video(self, path, autostart=True):
+        """Open a video as the camera input and start a new measurement session."""
+        self.timer.stop()
+        self.running = False
+        if self.media_capture is not None:
+            self.media_capture.release()
+            self.media_capture = None
+        self.media_path = path
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            capture.release()
+            self.media_path = None
+            QMessageBox.warning(self, "Could not open video", "This video file could not be read.")
+            self.media_path = None
+            return False
+        self.media_capture = capture
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        self.loop_rate_hz = float(fps) if fps and math.isfinite(fps) and 1 <= fps <= 120 else 30.0
+        self._reset_report_session()
+        self.frame_count = 0
+        total_frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+        self.video_info = {
+            "name": os.path.basename(path),
+            "width": int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            "height": int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            "fps": float(fps) if fps and math.isfinite(fps) and fps > 0 else None,
+            "frames": int(total_frames) if total_frames and total_frames > 0 else None,
+        }
+        info = self.video_info
+        length = (
+            f", {info['frames'] / info['fps']:.1f} s" if info["frames"] and info["fps"] else ""
         )
-        beacon_mask = cv2.GaussianBlur(beacon_mask, (5, 5), 0)
+        self._record_activity(
+            "VIDEO",
+            f"Loaded {info['name']} ({info['width']}x{info['height']}, "
+            f"{info['fps'] or 0:.1f} fps{length})",
+        )
+        self._start_video_benchmark(path, capture)
+        truth_note = "GROUND TRUTH LOADED" if self.video_metrics.ground_truth is not None else "NO GROUND TRUTH"
+        self.system_status.setText(f"● VIDEO LOADED   |   PTZ BYPASSED   |   {truth_note}")
+        if autostart:
+            self.running = True
+            self._start_loop()
+        return True
 
-        remove_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.circle(remove_mask, (ox, oy), radius, 255, -1)
-        img = cv2.inpaint(img, remove_mask, 7, cv2.INPAINT_TELEA)
+    # ==============================================================
+    # VIDEO INPUT (BENCHMARK 2: PTZ BYPASSED)
+    # ==============================================================
 
-        px0 = nx - (ox - x0)
-        py0 = ny - (oy - y0)
-        ph, pw = patch.shape[:2]
-        tx0, ty0 = max(0, px0), max(0, py0)
-        tx1, ty1 = min(w, px0 + pw), min(h, py0 + ph)
-        sx0, sy0 = tx0 - px0, ty0 - py0
-        sx1, sy1 = sx0 + (tx1 - tx0), sy0 + (ty1 - ty0)
+    VIDEO_FOV_DEG = (4.0, 3.0)      # reference camera FOV, used for angular error
 
-        if tx1 > tx0 and ty1 > ty0:
-            alpha = beacon_mask[sy0:sy1, sx0:sx1].astype(np.float32) / 255.0
-            alpha = alpha[..., None]
-            dst = img[ty0:ty1, tx0:tx1].astype(np.float32)
-            src = patch[sy0:sy1, sx0:sx1].astype(np.float32)
-            img[ty0:ty1, tx0:tx1] = (src * alpha + dst * (1.0 - alpha)).astype(np.uint8)
+    def _start_video_benchmark(self, path, capture):
+        """Set up the coarse-pointing pipeline and metrics for a new video."""
+        info = self.video_info
+        self.video_tracker = VideoBeaconTracker(
+            info["width"], info["height"], info["fps"] or 30.0, beacon_size=10, yolo=self.detector,
+        )
+        # YOLO's first inference takes seconds (model warm-up). Do it now,
+        # before playback, so it neither freezes a frame nor skews timing.
+        if not getattr(self, "_yolo_warm", False):
+            try:
+                self.detector.detect(np.zeros((320, 320, 3), np.uint8))
+            except Exception:
+                pass
+            self._yolo_warm = True
+        gt_path = find_ground_truth(path)
+        self.video_metrics = BenchmarkMetrics(
+            info["fps"] or 30.0, info["width"], info["height"], self.VIDEO_FOV_DEG, None,
+        )
+        if gt_path:
+            self._apply_ground_truth(gt_path, announce=False)
 
-        return img
+    def _apply_ground_truth(self, gt_path, announce=True):
+        try:
+            truth = load_ground_truth(gt_path, self.video_metrics.fps)
+        except Exception as exc:
+            QMessageBox.warning(self, "Ground truth not loaded", f"{os.path.basename(gt_path)}:\n{exc}")
+            return False
+        # Recompute live values for any frames already processed.
+        old = self.video_metrics
+        self.video_metrics = BenchmarkMetrics(old.fps, old.width, old.height, old.fov_deg, truth)
+        self.video_metrics.wall_started = old.wall_started
+        for result, frame_ms in zip(old.results, old.frame_ms or [None] * len(old.results)):
+            self.video_metrics.add(result, frame_ms)
+        self.video_info["ground_truth"] = gt_path
+        visible = sum(1 for value in truth.values() if value is not None)
+        self._record_activity(
+            "GROUND TRUTH",
+            f"Loaded {os.path.basename(gt_path)}: {len(truth)} frames, beacon visible in {visible}",
+        )
+        if announce:
+            QMessageBox.information(
+                self, "Ground truth loaded",
+                f"{os.path.basename(gt_path)}\n\n{len(truth)} frames ({visible} with the beacon visible).\n"
+                "Centroiding error and RMSE will be computed against it.",
+            )
+        return True
+
+    def _load_ground_truth(self):
+        if not self.media_path or getattr(self, "video_metrics", None) is None:
+            QMessageBox.information(self, "Load a video first",
+                                    "Upload a video, then load its ground-truth centroid file.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select ground-truth centroid file", os.path.dirname(self.media_path),
+            "Ground truth (*.csv *.txt);;All files (*)",
+        )
+        if path:
+            self._apply_ground_truth(path)
+
+    def _process_uploaded_frame(self, frame, frame_started=None):
+        """Run one video frame through the coarse-pointing pipeline (PTZ bypassed)."""
+        frame_started = frame_started or time.perf_counter()
+        index = self.video_metrics_frame_index()
+        result = self.video_tracker.process(frame, index)
+        metrics = self.video_metrics
+        truth = metrics.truth(index)
+        error = metrics.centroid_error(result)
+
+        self._draw_video_views(frame, result, truth)
+
+        live_state = {"LOCKED": "LOCKED", "TENTATIVE": "ACQUIRING", "COAST": "COASTING"}.get(result.state, "SEARCHING")
+        self.search_state = live_state
+        if result.measured:
+            status = f"● BEACON {live_state}   |   ({result.x:.1f}, {result.y:.1f}) px   |   SNR {result.snr:.0f}"
+        elif result.state == "COAST":
+            status = "● BEACON COASTING   |   FOLLOWING KALMAN PREDICTION"
+        else:
+            status = "● SEARCHING FOR BEACON   |   WHOLE-FRAME ACQUISITION"
+        self.system_status.setText(status)
+
+        # Detection confidence shown on the panel: SNR mapped to 0..1
+        # (0.5 at the tracking threshold, 1.0 at four times the threshold).
+        confidence = min(1.0, result.snr / (4 * VideoBeaconTracker.TRACK_SNR)) if result.measured else 0.0
+        self.display_confidence = confidence
+        self.display_source = result.source or "--"
+        self.current_confidence = confidence
+        self.current_source = result.source or "--"
+        self.current_distance = None
+        self.current_error = error[2] if error else float("nan")
+        bore = metrics.boresight(result)
+        center = (metrics.width / 2.0, metrics.height / 2.0)
+        self.frame_count += 1
+        if self.frame_count % 30 == 0:
+            self._sample_activity()
+
+        live = metrics.live_values()
+        self._update_pat_panel(
+            (result.x, result.y) if result.x is not None else None, confidence, self.display_source,
+            math.hypot(bore[0], bore[1]) if bore else float("nan"), None,
+            telemetry_center=center, ptz_bypassed=True,
+            overrides={
+                "acquisition": self._fmt(live["acquisition_s"], 2, " s"),
+                "reacquisition": self._fmt(live["reacquisition_s"], 2, " s"),
+                "distance_label": "Centroid err",
+                "distance": (self._fmt(live["error_px"], 2, " px") if metrics.ground_truth is not None
+                             else "no truth file"),
+                "pan_label": "Centroid RMSE",
+                "pan": self._fmt(live["rmse_px"], 2, " px") if metrics.ground_truth is not None else "no truth file",
+                "tilt_label": "Lock retention",
+                "tilt": self._fmt(live["lock_retention_pct"], 1, " %"),
+                "loop": "MEDIAN → MATCHED FILTER (+YOLO) → CENTROID → KALMAN",
+            },
+        )
+        self.current_processing_ms = result.processing_ms
+        frame_ms = (time.perf_counter() - frame_started) * 1000.0
+        metrics.add(result, frame_ms)
+        self.current_fps = min(self.video_metrics.fps, 1000.0 / max(1.0, frame_ms))
+
+    def video_metrics_frame_index(self):
+        return len(self.video_metrics.results)
+
+    def _draw_video_views(self, frame, result, truth):
+        """Scene view: whole frame with markers. Bore-sight view: zoom on the beacon."""
+        height, width = frame.shape[:2]
+        label = self.full_scene_label
+        scale = min(max(label.width(), 320) / width, max(label.height(), 240) / height)
+        display = cv2.resize(frame, (max(1, int(width * scale)), max(1, int(height * scale))),
+                             interpolation=cv2.INTER_AREA)
+        if display.ndim == 2:
+            display = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
+        dh, dw = display.shape[:2]
+        cv2.drawMarker(display, (dw // 2, dh // 2), (0, 255, 255), cv2.MARKER_CROSS, 24, 1)
+        if truth is not None:
+            tx, ty = int(round(truth[0] * scale)), int(round(truth[1] * scale))
+            cv2.drawMarker(display, (tx, ty), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 14, 1)
+        if result.x is not None:
+            bx, by = int(round(result.x * scale)), int(round(result.y * scale))
+            color = (0, 255, 0) if result.measured else (0, 170, 255)
+            box = max(8, int(result.size_px * scale) + 8) if result.measured else 14
+            cv2.rectangle(display, (bx - box, by - box), (bx + box, by + box), color, 2)
+            cv2.putText(display, f"{result.state} {result.x:.1f},{result.y:.1f}", (max(4, bx + box + 4), max(16, by - box)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        cv2.putText(display, f"FRAME {result.frame}  t={result.time_s:.2f}s  {result.processing_ms:.1f} ms",
+                    (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+        if truth is not None:
+            cv2.putText(display, "+ ground truth", (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1, cv2.LINE_AA)
+        label.setPixmap(self._cv_to_qpixmap(display, label))
+
+        # Bore-sight view: 4x zoom around the reported beacon position (or the centre).
+        cx, cy = (result.x, result.y) if result.x is not None else (width / 2, height / 2)
+        half_w, half_h = 60, 45
+        x0 = int(np.clip(round(cx) - half_w, 0, max(0, width - 2 * half_w)))
+        y0 = int(np.clip(round(cy) - half_h, 0, max(0, height - 2 * half_h)))
+        crop = frame[y0:y0 + 2 * half_h, x0:x0 + 2 * half_w]
+        if crop.size:
+            zoom = cv2.resize(crop, (crop.shape[1] * 4, crop.shape[0] * 4), interpolation=cv2.INTER_NEAREST)
+            if zoom.ndim == 2:
+                zoom = cv2.cvtColor(zoom, cv2.COLOR_GRAY2BGR)
+            if result.x is not None:
+                zx, zy = int(round((result.x - x0) * 4)), int(round((result.y - y0) * 4))
+                color = (0, 255, 0) if result.measured else (0, 170, 255)
+                cv2.drawMarker(zoom, (zx, zy), color, cv2.MARKER_CROSS, 40, 2)
+            if truth is not None:
+                gx, gy = int(round((truth[0] - x0) * 4)), int(round((truth[1] - y0) * 4))
+                cv2.drawMarker(zoom, (gx, gy), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 24, 2)
+            self.boresight_label.setPixmap(self._cv_to_qpixmap(zoom, self.boresight_label))
+
+    def _video_output_base(self):
+        folder = os.path.join(os.path.expanduser("~"), "Downloads", "fsoc-benchmark")
+        os.makedirs(folder, exist_ok=True)
+        stem = os.path.splitext(self.video_info.get("name", "video"))[0]
+        return os.path.join(folder, f"{stem}_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+
+    def _export_video_outputs(self, base=None, complete=None):
+        """Write centroid log, summary and PDF for the current video. Returns the PDF path."""
+        base = base or self._video_output_base()
+        metrics = self.video_metrics
+        info = dict(self.video_info)
+        metrics.write_csv(base + "_centroids.csv")
+        metrics.write_summary(base + "_summary.csv", {
+            "video": self.media_path, "resolution": f"{info['width']}x{info['height']}",
+            "video_fps": info.get("fps"), "ground_truth_file": info.get("ground_truth") or "",
+            "fov_deg": f"{metrics.fov_deg[0]}x{metrics.fov_deg[1]}",
+        })
+        events = [
+            (entry["time"][11:], self.REPORT_EVENT_NAMES.get(entry["event"], entry["event"]), entry["details"])
+            for entry in self._session_events()
+        ]
+        pdf = base + "_report.pdf"
+        write_video_benchmark_report(
+            pdf, metrics, info, events, self.video_complete if complete is None else complete,
+        )
+        return pdf
+
+    def _finish_video(self):
+        """End of the clip: log it and export the benchmark outputs automatically."""
+        if self.video_complete:
+            return
+        self.video_complete = True
+        processed = len(self.video_metrics.results)
+        self._record_activity(
+            "VIDEO",
+            f"Playback complete: {processed} frames processed ({processed / self.video_metrics.fps:.1f} s of video)",
+        )
+        try:
+            base = self._video_output_base()
+            self._export_video_outputs(base, complete=True)
+        except Exception as exc:
+            self._record_activity("REPORT", f"Automatic export failed: {exc}")
+            self.system_status.setText(f"● VIDEO COMPLETE   |   EXPORT FAILED: {exc}")
+            return
+        self._record_activity("REPORT", f"Benchmark outputs saved: {base}_centroids.csv / _summary.csv / _report.pdf")
+        s = self.video_metrics.summary()
+        rmse = f"RMSE {s['rmse_px']:.2f} px   |   " if s.get("rmse_px") is not None else ""
+        self.system_status.setText(
+            f"● VIDEO COMPLETE   |   {rmse}LOCK {self._fmt(s.get('lock_retention_pct'), 1, ' %')}   |   "
+            f"LOGS SAVED TO Downloads\\fsoc-benchmark"
+        )
+
+    # ==============================================================
+    # SCENARIO SIMULATION (BENCHMARK 1: VIRTUAL PTZ CAMERA)
+    # ==============================================================
+
+    POISSON_LEVELS = {1: 200.0, 2: 60.0, 3: 15.0}      # photons at full white
+    STATUS_STYLES = {
+        "ok": "background-color:#123b35; color:#4dffd8; border:1px solid #28d7b0;",
+        "warn": "background-color:#402c18; color:#ffd27a; border:1px solid #d99b42;",
+        "idle": "",
+    }
+
+    def _new_runner(self):
+        """Fresh scenario run from the current configuration."""
+        self.runner = ScenarioRunner(self.scenario_config, yolo=self.detector, yolo_async=True)
+        self.frame_count = 0
+        self._overview_key = None
+        self._fps_ema = 0.0
+        self._last_tick = None
+        self._scenario_exported = False
+        self._reset_report_session()
+        self._record_activity(
+            "SCENARIO",
+            f"Scenario '{self.runner.cfg.name}' started (seed {self.runner.seed}); "
+            f"{self.runner.cfg.motion} motion, target {self.runner.cfg.target_size_px} px",
+        )
+
+    def _set_status(self, text, style="idle"):
+        self.system_status.setText(text)
+        if getattr(self, "_status_style", None) != style:
+            # Restyling is costly; only do it when the state class changes.
+            self._status_style = style
+            extra = self.STATUS_STYLES[style]
+            self.system_status.setStyleSheet(
+                f"QLabel {{ {extra} border-radius:5px; padding:8px; font-family:Consolas; font-weight:bold; }}"
+                if extra else ""
+            )
+
+    def _open_scenario_dialog(self):
+        dialog = ScenarioDialog(self.scenario_config, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        self.scenario_config = dialog.config()
+        self._sync_controls_from_config()
+        self._record_activity("SCENARIO", f"Scenario '{self.scenario_config.name}' applied")
+        self._reset_simulation()
+
+    def _sync_controls_from_config(self):
+        cfg = self.scenario_config
+        widgets = [self.pattern_combo, self.decoy_slider] + list(self.disturbance_controls.values())
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.pattern_combo.setCurrentText("Auto" if cfg.auto_switch else cfg.motion)
+        self.decoy_slider.setValue(cfg.decoys)
+        self.decoy_count_label.setText(str(cfg.decoys))
+        c = self.disturbance_controls
+        c["salt_pepper_pct"].setValue(int(round(cfg.salt_pepper_pct)))
+        c["gaussian_sigma"].setValue(int(round(cfg.gaussian_sigma)))
+        poisson_level = 0
+        if cfg.poisson:
+            poisson_level = min(self.POISSON_LEVELS, key=lambda k: abs(self.POISSON_LEVELS[k] - cfg.poisson_peak))
+        c["poisson"].setValue(poisson_level)
+        c["jitter_px"].setValue(cfg.jitter_px)
+        c["atmosphere"].setCurrentText(cfg.atmosphere)
+        c["atmosphere_strength"].setValue(int(round(cfg.atmosphere_strength * 100)))
+        c["platform_motion"].setCurrentText(cfg.platform_motion)
+        c["platform_px_per_frame"].setValue(int(round(cfg.platform_px_per_frame)))
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._refresh_disturbance_labels()
 
     def _toggle_beacon_visibility(self):
-        if not self.beacon_hidden:
-            self.beacon_hidden = True
-            self.reacquire_active = False
-            self.reacquire_offset = None
-            self.reacquire_target_world = None
-            self.hide_button.setText("SHOW BEACON")
-            self.search_state = "PREDICTING"
-            self.system_status.setText("● BEACON HIDDEN   |   KALMAN PREDICTION ACTIVE")
-            return
-
-        predicted = self.kalman_prediction_world
-
-        if predicted is None:
-            self.beacon_hidden = False
-            self.reacquire_active = False
-            self.reacquire_offset = None
-            self.reacquire_target_world = None
-            self.hide_button.setText("HIDE BEACON")
-            self.system_status.setText("● BEACON VISIBLE   |   WAITING FOR KALMAN LOCK")
-            return
-
-        self.reacquire_target_world = (
-            float(predicted[0]),
-            float(predicted[1]),
-        )
-
-        self.beacon_hidden = False
-        self.reacquire_active = True
-        self.reacquire_offset = None
-        self.search_state = "REACQUIRING"
-        self.hide_button.setText("HIDE BEACON")
-        self.system_status.setText(
-            "● BEACON REAPPEARED   |   AT KALMAN PREDICTED POSITION"
+        self.beacon_hidden = not self.beacon_hidden
+        if self.runner is not None:
+            self.runner.scene.beacon_hidden = self.beacon_hidden
+        self.hide_button.setText("SHOW BEACON" if self.beacon_hidden else "HIDE BEACON")
+        self._record_activity(
+            "BEACON",
+            "Beacon hidden; tracker coasts, then searches" if self.beacon_hidden
+            else "Beacon visible again; re-acquisition timed from now",
         )
 
     def _reset_simulation(self):
         self.running = False
         self.timer.stop()
+        if self.media_capture is not None:
+            self.media_capture.release()
+            self.media_capture = None
+        self.media_path = None
         self.beacon_hidden = False
         self.hide_button.setText("HIDE BEACON")
-        self.kalman_prediction_world = None
-        self.reacquire_offset = None
-        self.reacquire_active = False
-        self.reacquire_target_world = None
-
-        self.scene = VirtualScene(
-            pattern=(
-                self.pattern_combo.currentText()
-                if self.pattern_combo.currentText() != "Auto"
-                else "circular"
-            ),
-            n_decoys=self.decoy_slider.value(),
-        )
-        _, start_pos = self.scene.render()
-        self.camera = VirtualPTZCamera()
-        self.camera.pan_x = start_pos[0]
-        self.camera.tilt_y = start_pos[1]
-        self.tracker = BeaconKalmanTracker(init_offset=(0, 0), max_coast_frames=None)
-        self.frame_count = 0
-        self.tracking_elapsed = 0.0
-        self.acquisition_time = None
-        self.reacquisition_time = None
-        self.reacquisition_started = None
-        self.was_locked = False
-        self.last_source = "kalman"
-        self.last_measurement_frame = -1
         self.search_state = "READY"
-        self.last_known_world_pos = (float(start_pos[0]), float(start_pos[1]))
-        self.search_angle = 0.0
-        self.search_radius = 0.0
-        self.enlarge_radius = 0.0
-        self.roam_target = None
-        self.current_dx = 0.0
-        self.current_dy = 0.0
-        self.current_error = float("nan")
-        self.current_confidence = 0.0
-        self.current_distance = None
-        self.current_source = "kalman"
-        self.display_confidence = 0.0
-        self.display_source = "YOLO"
-        self.pending_source = "YOLO"
-        self.source_hold_count = 0
-        self.sim_assist_active = False
-        self.target_visible_in_fov = False
-
-        for category, slider in self.disturbance_sliders.items():
-            slider.blockSignals(True)
-            slider.setValue(0)
-            slider.blockSignals(False)
-            self.disturbance_mgr.set_level(category, 0)
-            self.disturbance_value_labels[category].setText("OFF")
-
-        self._render_reset_frame()
-        self.system_status.setText(
-            "● SYSTEM READY   |   SIMULATION RESET   |   PRESS START"
-        )
-
-    def _render_reset_frame(self):
-        full_frame, true_pos = self.scene.render()
-
-        if self.beacon_hidden:
-            mask = np.zeros(full_frame.shape[:2], dtype=np.uint8)
-            cv2.circle(mask, tuple(map(int, true_pos)), 34, 255, -1)
-            full_frame = cv2.inpaint(full_frame, mask, 9, cv2.INPAINT_TELEA)
-
-        self._draw_static_views(full_frame, true_pos)
-
-    def _draw_static_views(self, full_frame, true_pos):
-        cropped = self.camera.crop(full_frame)
-        full_display = full_frame.copy()
-        cv2.rectangle(
-            full_display,
-            (
-                int(self.camera.pan_x - self.camera.fov_w // 2),
-                int(self.camera.tilt_y - self.camera.fov_h // 2),
-            ),
-            (
-                int(self.camera.pan_x + self.camera.fov_w // 2),
-                int(self.camera.tilt_y + self.camera.fov_h // 2),
-            ),
-            (0, 255, 255),
-            2,
-        )
-
-        cv2.circle(full_display, tuple(map(int, true_pos)), 9, (255, 255, 0), 1)
-        cv2.putText(
-            full_display,
-            "SIMULATION READY",
-            (10, 22),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1,
-        )
-        self.full_scene_label.setPixmap(
-            self._cv_to_qpixmap(full_display, self.full_scene_label)
-        )
-
-        bs = cropped.copy()
-        draw_crosshair(bs, self.screen_center, color=(0, 255, 255))
-        self.boresight_label.setPixmap(self._cv_to_qpixmap(bs, self.boresight_label))
+        self._new_runner()
+        self._draw_scenario_views(preview=True)
+        self._set_status("● SYSTEM READY   |   SCENARIO RESET   |   PRESS START")
 
     def _build_disturbance_panel(self):
+        """Live disturbance controls (spec values; the full set is in SCENARIO...)."""
         panel = QGridLayout()
-        panel.setSpacing(3)
+        panel.setHorizontalSpacing(8)
+        panel.setVerticalSpacing(3)
         panel.setColumnStretch(1, 1)
-
-        self.disturbance_sliders = {}
+        panel.setColumnStretch(4, 1)
+        self.disturbance_controls = {}
         self.disturbance_value_labels = {}
 
-        categories = ["fog", "noise", "jitter", "rain"]
-        for row, category in enumerate(categories):
-            label = QLabel(category.upper())
-            label.setMinimumWidth(70)
-            panel.addWidget(label, row, 0)
-            slider = QSlider(Qt.Horizontal)
-            slider.setMaximumWidth(700)
-            slider.setMinimum(0)
-            slider.setMaximum(3)
-            slider.setSingleStep(1)
-            slider.setPageStep(1)
-            slider.setValue(0)
-            slider.setTickPosition(QSlider.TicksBelow)
-            slider.setTickInterval(1)
-            slider.setToolTip(f"{category.upper()} intensity: " "0 = OFF, 3 = HIGH")
+        def slider(key, maximum, tip):
+            widget = QSlider(Qt.Horizontal)
+            widget.setRange(0, maximum)
+            widget.setToolTip(tip)
+            widget.valueChanged.connect(lambda _v, k=key: self._on_disturbance_changed(k))
+            widget.sliderReleased.connect(lambda k=key: self._log_disturbance(k))
+            return widget
 
-            value_label = QLabel("OFF")
-            value_label.setMinimumWidth(55)
-            value_label.setAlignment(Qt.AlignCenter)
+        def combo(key, items, tip):
+            widget = QComboBox()
+            widget.addItems(items)
+            widget.setToolTip(tip)
+            widget.currentTextChanged.connect(lambda _t, k=key: (self._on_disturbance_changed(k),
+                                                                  self._log_disturbance(k)))
+            return widget
 
-            slider.valueChanged.connect(self._make_disturbance_handler(category))
-            panel.addWidget(slider, row, 1)
-            panel.addWidget(value_label, row, 2)
-            self.disturbance_sliders[category] = slider
-            self.disturbance_value_labels[category] = value_label
+        rows = [
+            [("SALT & PEPPER", "salt_pepper_pct", slider("salt_pepper_pct", 20, "% of pixels (spec ~10 %)")),
+             ("ATMOSPHERE", "atmosphere", combo("atmosphere", ATMOSPHERES, "Clear, haze, fog, rain, low light"))],
+            [("GAUSSIAN σ", "gaussian_sigma", slider("gaussian_sigma", 50, "Standard deviation (spec max 20)")),
+             ("STRENGTH", "atmosphere_strength", slider("atmosphere_strength", 100, "Atmospheric effect strength"))],
+            [("POISSON", "poisson", slider("poisson", 3, "Photon shot noise: off / low / medium / high")),
+             ("PLATFORM", "platform_motion", combo("platform_motion", PLATFORM_MOTIONS, "Platform motion (spec default linear)"))],
+            [("JITTER", "jitter_px", slider("jitter_px", 20, "Camera jitter +/- px per frame (spec max 20)")),
+             ("PLATFORM SPEED", "platform_px_per_frame", slider("platform_px_per_frame", 20, "px per frame (spec max 20)"))],
+        ]
+        for row, pair in enumerate(rows):
+            for col, (label, key, widget) in enumerate(pair):
+                base = col * 3
+                name = QLabel(label)
+                name.setMinimumWidth(110)
+                value = QLabel("OFF")
+                value.setMinimumWidth(62)
+                value.setAlignment(Qt.AlignCenter)
+                panel.addWidget(name, row, base)
+                panel.addWidget(widget, row, base + 1)
+                panel.addWidget(value, row, base + 2)
+                self.disturbance_controls[key] = widget
+                self.disturbance_value_labels[key] = value
         return panel
 
-    def _make_disturbance_handler(self, category):
-        def handler(level):
-            self.disturbance_mgr.set_level(category, int(level))
-            names = {0: "OFF", 1: "LOW", 2: "MED", 3: "HIGH"}
-            self.disturbance_value_labels[category].setText(
-                names.get(int(level), str(level))
-            )
+    def _disturbance_values(self):
+        c = self.disturbance_controls
+        level = c["poisson"].value()
+        return {
+            "salt_pepper_pct": float(c["salt_pepper_pct"].value()),
+            "gaussian_sigma": float(c["gaussian_sigma"].value()),
+            "poisson": level > 0,
+            "poisson_peak": self.POISSON_LEVELS.get(level, self.scenario_config.poisson_peak),
+            "jitter_px": int(c["jitter_px"].value()),
+            "atmosphere": c["atmosphere"].currentText(),
+            "atmosphere_strength": c["atmosphere_strength"].value() / 100.0,
+            "platform_motion": c["platform_motion"].currentText(),
+            "platform_px_per_frame": float(c["platform_px_per_frame"].value()),
+        }
 
-        return handler
+    def _refresh_disturbance_labels(self):
+        v = self._disturbance_values()
+        labels = self.disturbance_value_labels
+        labels["salt_pepper_pct"].setText(f"{v['salt_pepper_pct']:.0f} %" if v["salt_pepper_pct"] else "OFF")
+        labels["gaussian_sigma"].setText(f"σ {v['gaussian_sigma']:.0f}" if v["gaussian_sigma"] else "OFF")
+        labels["poisson"].setText({0: "OFF", 1: "LOW", 2: "MED", 3: "HIGH"}[self.disturbance_controls["poisson"].value()])
+        labels["jitter_px"].setText(f"±{v['jitter_px']} px" if v["jitter_px"] else "OFF")
+        labels["atmosphere"].setText("")
+        labels["atmosphere_strength"].setText(f"{v['atmosphere_strength']:.2f}")
+        labels["platform_motion"].setText("")
+        labels["platform_px_per_frame"].setText(f"{v['platform_px_per_frame']:.0f} px/f"
+                                                if v["platform_px_per_frame"] else "OFF")
+
+    def _on_disturbance_changed(self, key):
+        values = self._disturbance_values()
+        if key == "platform_px_per_frame" and values[key] > 0 and values["platform_motion"] == "none":
+            # Spec default platform motion is linear.
+            self.disturbance_controls["platform_motion"].blockSignals(True)
+            self.disturbance_controls["platform_motion"].setCurrentText("linear")
+            self.disturbance_controls["platform_motion"].blockSignals(False)
+            values["platform_motion"] = "linear"
+        for name, value in values.items():
+            setattr(self.scenario_config, name, value)
+        if self.runner is not None and not self.media_path:
+            self.runner.update_disturbances(**values)
+        self._refresh_disturbance_labels()
+        if not isinstance(self.disturbance_controls[key], QSlider) or not self.disturbance_controls[key].isSliderDown():
+            if isinstance(self.disturbance_controls[key], QSlider):
+                self._log_disturbance(key)
+
+    def _log_disturbance(self, key):
+        label = self.disturbance_value_labels[key].text() or self._disturbance_values()[key]
+        self._record_activity("PARAMETER", f"{key.replace('_', ' ')} set to {label}")
 
     def _on_pattern_changed(self, text):
-        if text == "Auto":
-            self.scene.enable_auto_rotate()
-        else:
-            self.scene.disable_auto_rotate()
-            self.scene.set_pattern(text)
+        auto = text == "Auto"
+        self.scenario_config.auto_switch = auto
+        if not auto:
+            self.scenario_config.motion = text
+        if self.runner is not None:
+            self.runner.set_pattern(self.scenario_config.motion, auto=auto)
+        self._record_activity("PATTERN", f"Motion pattern set to {text}")
 
     def _on_decoy_count_changed(self, value):
         self.decoy_count_label.setText(str(value))
-        self.scene.regenerate_decoys(n_decoys=value)
+        self.scenario_config.decoys = int(value)
+        if self.runner is not None:
+            self.runner.set_decoys(int(value))
+        self._record_activity("PARAMETER", f"Decoy target count set to {value}")
+
+    def _scenario_step(self, frame_started):
+        runner = self.runner
+        now = time.perf_counter()
+        if self._last_tick is not None:
+            interval = now - self._last_tick
+            rate = 1.0 / interval if interval > 0 else 0.0
+            self._fps_ema = rate if not self._fps_ema else 0.9 * self._fps_ema + 0.1 * rate
+        self._last_tick = now
+        result = runner.step(frame_started)
+        self.frame_count += 1
+        self.current_fps = self._fps_ema
+        self.current_processing_ms = result.processing_ms
+        self.search_state = {"LOCKED": "LOCKED", "TENTATIVE": "ACQUIRING",
+                             "COAST": "COASTING"}.get(result.state, "SEARCHING")
+        error = runner.metrics.centroid_error(result)
+        self.current_error = error[2] if error else float("nan")
+        self._draw_scenario_views()
+        if self.frame_count % 3 == 0:
+            self._update_scenario_panel(result)
+        if self.frame_count % 30 == 0:
+            self._sample_activity()
+        if self.search_state == "LOCKED":
+            style, detail = "ok", f"LOCKED   |   CENTROID ERR {self._fmt(self.current_error, 2, ' px')}"
+        elif self.search_state in ("ACQUIRING", "COASTING"):
+            style, detail = "warn", self.search_state
+        else:
+            style, detail = "warn", "SEARCHING   |   SPIRAL SCAN"
+        self._set_status(
+            f"● t = {runner.time_s:6.2f} s   |   PAT: {detail}   |   {self._fps_ema:4.1f} FPS", style
+        )
+        if runner.finished():
+            self._finish_scenario()
+
+    def _finish_scenario(self):
+        self.running = False
+        self.timer.stop()
+        if self._scenario_exported:
+            return
+        self._scenario_exported = True
+        self._record_activity("SCENARIO", f"Scenario complete after {self.runner.time_s:.1f} s")
+        try:
+            base = self._scenario_output_base()
+            self._export_scenario_outputs(base)
+        except Exception as exc:
+            self._record_activity("REPORT", f"Automatic export failed: {exc}")
+            self._set_status(f"● SCENARIO COMPLETE   |   EXPORT FAILED: {exc}", "warn")
+            return
+        s = self.runner.metrics.summary()
+        self._set_status(
+            f"● SCENARIO COMPLETE   |   ACQ {self._fmt(s.get('acquisition_time_s'), 2, ' s')}   |   "
+            f"LOCK {self._fmt(s.get('lock_retention_pct'), 1, ' %')}   |   RMSE {self._fmt(s.get('rmse_px'), 2, ' px')}"
+            f"   |   LOGS SAVED TO Downloads\\fsoc-benchmark", "ok"
+        )
+
+    def _scenario_output_base(self):
+        folder = os.path.join(os.path.expanduser("~"), "Downloads", "fsoc-benchmark")
+        os.makedirs(folder, exist_ok=True)
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.runner.cfg.name) or "scenario"
+        return os.path.join(folder, f"scenario_{safe}_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+
+    def _export_scenario_outputs(self, base=None):
+        base = base or self._scenario_output_base()
+        events = [
+            (entry["time"][11:], self.REPORT_EVENT_NAMES.get(entry["event"], entry["event"]), entry["details"])
+            for entry in self._session_events()
+        ]
+        export_scenario_outputs(self.runner, base, events=events, complete=self.runner.finished())
+        self._record_activity("REPORT", f"Scenario logs saved: {base}_frames.csv / _summary.csv / _report.pdf")
+        return base + "_report.pdf"
+
+    def _update_scenario_panel(self, result):
+        runner = self.runner
+        cfg = runner.cfg
+        live = runner.metrics.live_values()
+        pan = (runner.camera[0] - cfg.screen_width / 2) / cfg.px_per_deg_x
+        tilt = (runner.camera[1] - cfg.screen_height / 2) / cfg.px_per_deg_y
+        center = (cfg.camera_width / 2.0, cfg.camera_height / 2.0)
+        offset = (math.hypot(result.x - center[0], result.y - center[1]) if result.x is not None else float("nan"))
+        confidence = min(1.0, result.snr / (4 * VideoBeaconTracker.TRACK_SNR)) if result.measured else 0.0
+        self._update_pat_panel(
+            (result.x, result.y) if result.x is not None else None, confidence, result.source or "--",
+            offset, None, telemetry_center=center, ptz_bypassed=False,
+            overrides={
+                "acquisition": self._fmt(live["acquisition_s"], 2, " s"),
+                "reacquisition": self._fmt(live["reacquisition_s"], 2, " s"),
+                "distance_label": "Centroid err",
+                "distance": self._fmt(live["error_px"], 2, " px"),
+                "pan_label": "Pan / tilt",
+                "pan": f"{pan:+.2f}° / {tilt:+.2f}°",
+                "tilt_label": "Lock retention",
+                "tilt": self._fmt(live["lock_retention_pct"], 1, " %"),
+                "loop": "SPIRAL SEARCH → MATCHED FILTER (+YOLO) → KALMAN → PTZ",
+            },
+        )
+
+    @staticmethod
+    def _pixmap(image):
+        if image.ndim == 2:
+            h, w = image.shape
+            qimg = QImage(image.data, w, h, w, QImage.Format_Grayscale8).copy()
+        else:
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+        return QPixmap.fromImage(qimg)
+
+    def _draw_scenario_views(self, preview=False):
+        """Left: whole screen with the camera footprint. Right: the camera image."""
+        runner = self.runner
+        if runner is None:
+            return
+        if preview or self.frame_count % 2 == 0:
+            # The screen overview is a thumbnail; every other frame is plenty.
+            self._draw_screen_overview(runner)
+        self._draw_camera_view(runner, preview)
+
+    def _state_color(self):
+        return {"LOCKED": (80, 255, 120), "ACQUIRING": (0, 210, 255),
+                "COASTING": (0, 170, 255)}.get(self.search_state, (60, 60, 255))
+
+    def _draw_screen_overview(self, runner):
+        cfg = runner.cfg
+        scene = runner.scene
+        state = self.search_state
+        color = self._state_color()
+
+        label = self.full_scene_label
+        lw, lh = max(label.width(), 320), max(label.height(), 240)
+        scale = min(lw / cfg.screen_width, lh / cfg.screen_height)
+        key = (id(runner), lw, lh)
+        if self._overview_key != key:
+            pad = scene.pad
+            size = (max(1, int(cfg.screen_width * scale)), max(1, int(cfg.screen_height * scale)))
+            if scene.background_bgr is not None:
+                screen = scene.background_bgr[pad:pad + cfg.screen_height, pad:pad + cfg.screen_width]
+                self._overview_base = cv2.resize(screen, size, interpolation=cv2.INTER_AREA)
+            else:
+                screen = scene.background[pad:pad + cfg.screen_height, pad:pad + cfg.screen_width]
+                small = cv2.resize(screen, size, interpolation=cv2.INTER_AREA)
+                small = cv2.convertScaleAbs(small, alpha=1.5, beta=12)  # brighten the dark sky for viewing
+                self._overview_base = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+            self._overview_key = key
+        view = self._overview_base.copy()
+        # Decoy beacons: white spots at their own brightness.
+        for d in scene.decoys:
+            level = int(d["level"])
+            cv2.circle(view, (int(d["pos"][0] * scale), int(d["pos"][1] * scale)),
+                       max(2, int(round(d["size"] * scale))), (level, level, level), -1, cv2.LINE_AA)
+        # The designated beacon: bright core with its halo rings (original look).
+        bx, by = int(scene.motion.pos[0] * scale), int(scene.motion.pos[1] * scale)
+        core = max(2, int(round(cfg.target_size_px * scale)))
+        if runner.beacon_visible():
+            if cfg.target_shape == "ringed":
+                cv2.circle(view, (bx, by), int(core * 3.5), (80, 80, 80), 1, cv2.LINE_AA)
+                cv2.circle(view, (bx, by), core * 2, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.circle(view, (bx, by), core, (255, 255, 255), -1, cv2.LINE_AA)
+        else:
+            cv2.circle(view, (bx, by), core * 2, (110, 110, 110), 1, cv2.LINE_AA)   # hidden: outline only
+        cam = runner.camera
+        x0, y0 = int((cam[0] - cfg.camera_width / 2) * scale), int((cam[1] - cfg.camera_height / 2) * scale)
+        x1, y1 = int((cam[0] + cfg.camera_width / 2) * scale), int((cam[1] + cfg.camera_height / 2) * scale)
+        cv2.rectangle(view, (x0, y0), (x1, y1), color, 2)
+        cv2.drawMarker(view, (int(cam[0] * scale), int(cam[1] * scale)), color, cv2.MARKER_CROSS, 10, 1)
+        cv2.putText(view, f"SCREEN {cfg.screen_width}x{cfg.screen_height}   t={runner.time_s:.2f}s   {state}",
+                    (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        label.setPixmap(self._pixmap(view))
+
+    def _draw_camera_view(self, runner, preview):
+        cfg = runner.cfg
+        scene = runner.scene
+        color = self._state_color()
+        frame, origin = runner.last_frame, runner.last_origin
+        if frame is None or preview:
+            origin = runner.camera - np.array([cfg.camera_width / 2, cfg.camera_height / 2])
+            frame = apply_disturbances(scene.render_camera(origin, runner.beacon_visible(), runner.time_s),
+                                       cfg, runner.rng)
+        blabel = self.boresight_label
+        bw, bh = max(blabel.width(), 200), max(blabel.height(), 150)
+        s = min(bw / cfg.camera_width, bh / cfg.camera_height)
+        size = (max(1, int(cfg.camera_width * s)), max(1, int(cfg.camera_height * s)))
+        # Colour view (the tracker still uses the monochrome sensor frame).
+        cam_view = scene.colourise(frame, origin, size) if cfg.camera_type == "colour" else None
+        if cam_view is None:
+            cam_view = cv2.cvtColor(cv2.resize(frame, size, interpolation=cv2.INTER_AREA), cv2.COLOR_GRAY2BGR)
+        ch, cw = cam_view.shape[:2]
+        cv2.drawMarker(cam_view, (cw // 2, ch // 2), (0, 255, 255), cv2.MARKER_CROSS, 22, 1)
+        result = runner.last_result
+        if not preview and result is not None and result.x is not None:
+            px, py = int(result.x * s), int(result.y * s)
+            # Box just outside the beacon (and its outer halo ring) so it stays visible.
+            extent = cfg.target_size_px * (1.75 if cfg.target_shape == "ringed" else 0.6)
+            box = int(extent * s) + 5
+            cv2.rectangle(cam_view, (px - box, py - box), (px + box, py + box), color, 1)
+        truth = runner.last_truth
+        if not preview and truth is not None:
+            cv2.drawMarker(cam_view, (int(truth[0] * s), int(truth[1] * s)), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 10, 1)
+        blabel.setPixmap(self._pixmap(cam_view))
+
+    def _record_activity(self, event, details, severity="INFO"):
+        from datetime import datetime
+        self.activity_log.append({
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "event": str(event), "details": str(details), "severity": str(severity),
+            "session": getattr(self, "report_session_id", 0),
+        })
+        if len(self.activity_log) > 3000:
+            del self.activity_log[:500]
+
+    def _sample_activity(self):
+        """Once per second: log state changes, reference crossings and a telemetry sample."""
+        metrics = self.video_metrics if self.media_path else (self.runner.metrics if self.runner else None)
+        live = metrics.live_values() if metrics is not None else {}
+        state = self.search_state
+        if state != self.activity_previous_state:
+            self._record_activity("TRACKING", f"Beacon state changed to {state}")
+            self.activity_previous_state = state
+        fps = self.current_fps
+        lock = live.get("lock_retention_pct")
+        checks = (("fps", 0 < fps < 30, f"Update rate {fps:.1f} Hz (reference 30 Hz)"),
+                  ("lock", lock is not None and lock < 95, f"Beacon lock retention {self._fmt(lock, 1, '%')} (reference 95%)"))
+        for key, crossed, details in checks:
+            if crossed and key not in self.activity_alerts:
+                self._record_activity("THRESHOLD ALERT", details, "ALERT")
+            elif not crossed and key in self.activity_alerts:
+                self._record_activity("THRESHOLD CLEARED", f"{key.upper()} back within reference")
+            if crossed:
+                self.activity_alerts.add(key)
+            else:
+                self.activity_alerts.discard(key)
+        self._record_activity(
+            "SAMPLE",
+            f"state={state}; fps={fps:.1f}; centroid_error={self._fmt(live.get('error_px'), 2, 'px')}; "
+            f"lock_retention={self._fmt(lock, 1, '%')}; processing={self.current_processing_ms:.2f}ms; "
+            f"disturbances={self._disturbance_text()}",
+        )
+
+    def _disturbance_text(self):
+        cfg = self.scenario_config
+        parts = []
+        if cfg.salt_pepper_pct:
+            parts.append(f"s&p {cfg.salt_pepper_pct:g}%")
+        if cfg.gaussian_sigma:
+            parts.append(f"gaussian {cfg.gaussian_sigma:g}")
+        if cfg.poisson:
+            parts.append(f"poisson {cfg.poisson_peak:g}")
+        if cfg.jitter_px:
+            parts.append(f"jitter {cfg.jitter_px}px")
+        if cfg.atmosphere != "clear":
+            parts.append(f"{cfg.atmosphere} {cfg.atmosphere_strength:.2f}")
+        if cfg.platform_motion != "none" and cfg.platform_px_per_frame:
+            parts.append(f"platform {cfg.platform_motion} {cfg.platform_px_per_frame:g}px/f")
+        return ", ".join(parts) or "none"
+
+    def _reset_report_session(self):
+        """Start a fresh measurement window for the next generated report."""
+        self.report_session_id = getattr(self, "report_session_id", 0) + 1
+        self.activity_alerts = set()
+        self.activity_previous_state = None
+        self.video_info = {}
+        self.video_complete = False
+        self.video_tracker = None
+        self.video_metrics = None
+
+    def _show_activity_log(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Beacon Activity Log")
+        dialog.resize(1000, 580)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(self.activity_log), 4, dialog)
+        table.setHorizontalHeaderLabels(["TIME", "TYPE", "DETAILS", "LEVEL"])
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        for row, entry in enumerate(self.activity_log):
+            for col, key in enumerate(("time", "event", "details", "severity")):
+                table.setItem(row, col, QTableWidgetItem(entry[key]))
+        layout.addWidget(table)
+        dialog.exec_()
+
+    # ==============================================================
+    # TECHNICAL REPORT
+    # ==============================================================
+
+    REPORT_EVENT_NAMES = {
+        "THRESHOLD ALERT": "REFERENCE CROSSED",
+        "THRESHOLD CLEARED": "REFERENCE RESTORED",
+    }
+
+    @staticmethod
+    def _fmt(value, digits, unit=""):
+        if value is None or not math.isfinite(value):
+            return "--"
+        return f"{value:.{digits}f}{unit}"
+
+    def _session_events(self):
+        return [
+            entry for entry in self.activity_log
+            if entry["event"] != "SAMPLE" and entry.get("session") == self.report_session_id
+        ]
+
+    def _export_report_pdf(self):
+        now = datetime.now()
+        report_id = now.strftime("FSOC-%Y%m%d-%H%M%S")
+        video_mode = bool(self.media_path)
+        kind = "video-tracking" if video_mode else "2d-tracking"
+        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+        os.makedirs(downloads, exist_ok=True)
+        path = os.path.join(downloads, f"fsoc-{kind}-report-{report_id[5:]}.pdf")
+        try:
+            if video_mode:
+                path = self._export_video_outputs()
+            else:
+                path = self._export_scenario_outputs()
+        except Exception as exc:
+            QMessageBox.warning(self, "Report not saved", f"The report could not be generated:\n{exc}")
+            return
+        self._record_activity("REPORT", f"Technical report saved to {path}")
+        # Open the report that was just written, so an older file in
+        # Downloads is never mistaken for it.
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        QMessageBox.information(
+            self, "Report downloaded",
+            f"Report saved to your Downloads folder and opened:\n\n{os.path.basename(path)}",
+        )
 
     def _cv_to_qpixmap(self, bgr_frame, target_label=None):
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
@@ -796,56 +1401,14 @@ class Dashboard(QWidget):
                 )
         return pix
 
-    def _normalize_source(self, source):
-        if source is None:
-            return self.display_source
-        text = str(source).upper()
-        if "YOLO" in text:
-            return "YOLO"
-        if "CLASS" in text or "TRAD" in text:
-            return "CLASSICAL"
-        if "KALMAN" in text:
-            return "KALMAN"
-        if "SIM" in text:
-            return "SIM-ASSIST"
-        if "WORLD" in text or "GUIDE" in text:
-            return "WORLD-GUIDE"
-        return self.display_source
-
-    def _stabilize_telemetry(self, confidence, source):
-        try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        confidence = float(np.clip(confidence, 0.0, 1.0))
-        if self.frame_count <= 1:
-            self.display_confidence = confidence
-        else:
-            self.display_confidence = (
-                self.CONFIDENCE_ALPHA * confidence
-                + (1.0 - self.CONFIDENCE_ALPHA) * self.display_confidence
-            )
-        candidate = self._normalize_source(source)
-        if candidate == self.display_source:
-            self.pending_source = candidate
-            self.source_hold_count = 0
-        else:
-            if candidate == self.pending_source:
-                self.source_hold_count += 1
-            else:
-                self.pending_source = candidate
-                self.source_hold_count = 1
-            if self.source_hold_count >= self.SOURCE_HOLD_FRAMES:
-                self.display_source = self.pending_source
-                self.source_hold_count = 0
-        return (self.display_confidence, self.display_source)
-
     def _update_pat_panel(
-        self, tracked_pos, display_confidence, display_source, error, dist_m
+        self, tracked_pos, display_confidence, display_source, error, dist_m,
+        telemetry_center=None, ptz_bypassed=False, overrides=None,
     ):
+        center_x, center_y = telemetry_center or self.screen_center
         if tracked_pos is not None:
-            dx = tracked_pos[0] - self.screen_center[0]
-            dy = tracked_pos[1] - self.screen_center[1]
+            dx = tracked_pos[0] - center_x
+            dy = tracked_pos[1] - center_y
 
         else:
             dx = 0.0
@@ -853,8 +1416,23 @@ class Dashboard(QWidget):
 
         error_text = f"{error:.1f} px" if math.isfinite(error) else "--"
         dist_text = f"{dist_m:.1f} m" if dist_m is not None else "--"
-        acquisition_text = "--" if self.acquisition_time is None else f"{self.acquisition_time:.2f} s"
-        reacquisition_text = "--" if self.reacquisition_time is None else f"{self.reacquisition_time:.2f} s"
+        acquisition_text = "--" if ptz_bypassed or self.acquisition_time is None else f"{self.acquisition_time:.2f} s"
+        reacquisition_text = "--" if ptz_bypassed or self.reacquisition_time is None else f"{self.reacquisition_time:.2f} s"
+        pan_text = "PTZ BYPASSED" if ptz_bypassed else "--"
+        tilt_text = "PTZ BYPASSED" if ptz_bypassed else "--"
+        loop_text = "YOLO → VIDEO DETECTION → PTZ BYPASSED" if ptz_bypassed else "YOLO → FUSION → KALMAN → PTZ"
+        distance_label = "Distance"
+        pan_label, tilt_label = "PAN", "TILT"
+        if overrides:
+            acquisition_text = overrides.get("acquisition", acquisition_text)
+            reacquisition_text = overrides.get("reacquisition", reacquisition_text)
+            dist_text = overrides.get("distance", dist_text)
+            distance_label = overrides.get("distance_label", distance_label)
+            pan_text = overrides.get("pan", pan_text)
+            tilt_text = overrides.get("tilt", tilt_text)
+            pan_label = overrides.get("pan_label", pan_label)
+            tilt_label = overrides.get("tilt_label", tilt_label)
+            loop_text = overrides.get("loop", loop_text)
 
         panel_html = f"""
         <table width="100%"
@@ -862,10 +1440,10 @@ class Dashboard(QWidget):
                cellpadding="1"
                style="
                    font-family:Consolas,monospace;
-                   font-size: 8px;
+                   font-size: 11px;
                    color:#b9cbd6;
                    border-collapse:collapse;
-                   line-height:1.0;
+                   line-height:1.15;
                ">
           <tr>
             <td colspan="2"
@@ -873,7 +1451,7 @@ class Dashboard(QWidget):
                 style="
                     color:#d7e2ea;
                     border-bottom:1px solid #607784;
-                    padding:3px;
+                    padding:5px;
                 ">
                 FSOC PAT TELEMETRY
             </td>
@@ -882,7 +1460,7 @@ class Dashboard(QWidget):
             <td colspan="2"
                 style="
                     color:#54f5d0;
-                    padding-top:2px;
+                    padding-top:5px;
                 ">
                 TARGET
             </td>
@@ -902,7 +1480,7 @@ class Dashboard(QWidget):
                 style="
                     border-top:1px solid #607784;
                     color:#54f5d0;
-                    padding-top:2px;
+                    padding-top:5px;
                 ">
                 DETECTION / TRACKING
             </td>
@@ -920,7 +1498,7 @@ class Dashboard(QWidget):
             </td>
           </tr>
           <tr>
-            <td>Distance</td>
+            <td>{distance_label}</td>
             <td align="right">
                 {dist_text}
             </td>
@@ -932,7 +1510,7 @@ class Dashboard(QWidget):
                 style="
                     border-top:1px solid #607784;
                     color:#54f5d0;
-                    padding-top:2px;
+                    padding-top:5px;
                 ">
                 BORESIGHT ERROR
             </td>
@@ -960,21 +1538,21 @@ class Dashboard(QWidget):
                 style="
                     border-top:1px solid #607784;
                     color:#54f5d0;
-                    padding-top:2px;
+                    padding-top:5px;
                 ">
-                VIRTUAL PTZ
+                {"PTZ BYPASSED" if ptz_bypassed else "VIRTUAL PTZ"}
             </td>
           </tr>
           <tr>
-            <td>PAN</td>
+            <td>{pan_label}</td>
             <td align="right">
-                {float(self.camera.pan_x):.1f}
+                {pan_text}
             </td>
           </tr>
           <tr>
-            <td>TILT</td>
+            <td>{tilt_label}</td>
             <td align="right">
-                {float(self.camera.tilt_y):.1f}
+                {tilt_text}
             </td>
           </tr>
           <tr>
@@ -982,7 +1560,7 @@ class Dashboard(QWidget):
                 style="
                     border-top:1px solid #607784;
                     color:#54f5d0;
-                    padding-top:2px;
+                    padding-top:5px;
                 ">
                 ALIGNMENT LOOP
             </td>
@@ -990,7 +1568,7 @@ class Dashboard(QWidget):
 
           <tr>
             <td colspan="2">
-                YOLO → FUSION → KALMAN → PTZ
+                {loop_text}
             </td>
           </tr>
           <tr>
@@ -1003,7 +1581,7 @@ class Dashboard(QWidget):
           <tr>
             <td>Tracking</td>
             <td align="right">
-                ACTIVE
+                {"ACTIVE" if self.search_state == "LOCKED" else "SEARCHING" if ptz_bypassed else "ACTIVE"}
             </td>
           </tr>
 
@@ -1014,527 +1592,50 @@ class Dashboard(QWidget):
 
         self.pat_panel.setText(panel_html)
 
+    def _start_loop(self):
+        self._next_deadline = time.perf_counter()
+        self.timer.start(0)
+
+    def _tick(self):
+        """Run one frame, then re-arm for the next 1 / rate deadline."""
+        if not self.running:
+            return
+        self.update_frame()
+        if not self.running:
+            return
+        period = 1.0 / self.loop_rate_hz
+        now = time.perf_counter()
+        self._next_deadline = (self._next_deadline or now) + period
+        if self._next_deadline < now - period:
+            # More than a frame behind (e.g. a slow frame): resynchronise
+            # rather than bursting to catch up.
+            self._next_deadline = now
+        self.timer.start(max(0, int((self._next_deadline - now) * 1000)))
+
     def update_frame(self):
 
         if not self.running:
             return
+        frame_started = time.perf_counter()
 
-        full_frame, raw_true_pos = self.scene.render()
-        true_pos = (float(raw_true_pos[0]), float(raw_true_pos[1]))
+        if self.media_path:
+            ok, frame = self.media_capture.read() if self.media_capture is not None else (False, None)
+            if not ok:
+                self.timer.stop()
+                self.running = False
+                if self.media_capture is not None:
+                    self.media_capture.release()
+                    self.media_capture = None
+                self._finish_video()
+                return
+            self._process_uploaded_frame(frame, frame_started)
+            return
 
-        if self.reacquire_active:
-            if self.reacquire_offset is None:
-                target = self.reacquire_target_world
-                if target is not None:
-                    self.reacquire_offset = (
-                        float(target[0]) - float(raw_true_pos[0]),
-                        float(target[1]) - float(raw_true_pos[1]),
-                    )
-                    true_pos = (float(target[0]), float(target[1]))
-                else:
-                    self.reacquire_active = False
-            else:
-                true_pos = (
-                    float(raw_true_pos[0]) + float(self.reacquire_offset[0]),
-                    float(raw_true_pos[1]) + float(self.reacquire_offset[1]),
-                )
-
-            if self.reacquire_active:
-                full_frame = self._relocate_rendered_beacon(
-                    full_frame,
-                    raw_true_pos,
-                    true_pos,
-                )
-                self.reacquire_target_world = None
-
-        if self.beacon_hidden:
-            mask = np.zeros(full_frame.shape[:2], dtype=np.uint8)
-            cv2.circle(mask, tuple(map(int, true_pos)), 22, 255, -1)
-            full_frame = cv2.inpaint(full_frame, mask, 5, cv2.INPAINT_TELEA)
-        full_frame = self.disturbance_mgr.apply_to_frame(full_frame)
-        cropped = self.camera.crop(full_frame)
-        crop_x0 = self.camera.pan_x - self.camera.fov_w // 2
-        crop_y0 = self.camera.tilt_y - self.camera.fov_h // 2
-        true_local = (
-            int(true_pos[0] - crop_x0),
-            int(true_pos[1] - crop_y0),
-        )
-        target_visible = (
-            0 <= true_local[0] < self.camera.fov_w
-            and 0 <= true_local[1] < self.camera.fov_h
-        )
-        self.target_visible_in_fov = target_visible
-        self.last_known_world_pos = (float(true_pos[0]), float(true_pos[1]))
-        yolo_pos = None
-        yolo_score = 0.0
-        classical_pos = None
-        classical_score = 0.0
-        measurement_found = False
-        disturbance_active = any(
-            value > 0 for value in self.disturbance_mgr.state.values()
-        )
-        detection_input = (
-            denoise_for_detection(cropped) if disturbance_active else cropped
-        )
-        gray = cv2.cvtColor(detection_input, cv2.COLOR_BGR2GRAY)
-        try:
-            yolo_pos, _ = self.detector.detect(detection_input)
-        except Exception:
-            yolo_pos = None
-        if yolo_pos is not None:
-            yolo_score = score_candidate(gray, yolo_pos[0], yolo_pos[1])
-        try:
-            classical_pos, classical_score = detect_beacon_classical(
-                detection_input, gray=gray
-            )
-        except Exception:
-            classical_pos = None
-            classical_score = 0.0
-        if yolo_pos is not None and yolo_score >= 0.5:
-            measurement_found = True
-        if classical_pos is not None and classical_score >= 0.5:
-            measurement_found = True
-        tracked_pos = None
-        tracked_world_pos = None
-        final_conf = 0.0
-        source = "world-guide"
-        self.sim_assist_active = False
-
-        candidates = []
-        if yolo_pos is not None and yolo_score >= 0.5:
-            candidates.append((yolo_pos, yolo_score, "yolo"))
-        if classical_pos is not None and classical_score >= 0.5:
-            candidates.append((classical_pos, classical_score, "classical"))
-        if candidates and not self.beacon_hidden:
-            best_local, best_score, best_source = max(
-                candidates,
-                key=lambda item: item[1],
-            )
-
-            best_world = (
-                float(self.camera.pan_x)
-                + (float(best_local[0]) - float(self.screen_center[0])),
-                float(self.camera.tilt_y)
-                + (float(best_local[1]) - float(self.screen_center[1])),
-            )
-            tracked_world_pos, kf_conf = self.tracker.update(best_world)
-            if tracked_world_pos is not None:
-                tracked_pos = (
-                    int(
-                        round(
-                            float(tracked_world_pos[0])
-                            - float(self.camera.pan_x)
-                            + float(self.screen_center[0])
-                        )
-                    ),
-                    int(
-                        round(
-                            float(tracked_world_pos[1])
-                            - float(self.camera.tilt_y)
-                            + float(self.screen_center[1])
-                        )
-                    ),
-                )
-            final_conf = max(float(best_score), float(kf_conf))
-            source = best_source
-            self.last_source = source
-            self.last_measurement_frame = self.frame_count
-            self.kalman_prediction_world = (
-                tuple(tracked_world_pos) if tracked_world_pos is not None else None
-            )
-        elif self.beacon_hidden:
-            tracked_world_pos, kf_conf = self.tracker.update(None)
-            self.kalman_prediction_world = (
-                tuple(tracked_world_pos) if tracked_world_pos is not None else None
-            )
-            if tracked_world_pos is not None:
-                tracked_pos = (
-                    int(
-                        round(
-                            float(tracked_world_pos[0])
-                            - float(self.camera.pan_x)
-                            + float(self.screen_center[0])
-                        )
-                    ),
-                    int(
-                        round(
-                            float(tracked_world_pos[1])
-                            - float(self.camera.tilt_y)
-                            + float(self.screen_center[1])
-                        )
-                    ),
-                )
-
-                final_conf = float(kf_conf)
-            else:
-                tracked_pos = None
-                final_conf = 0.0
-            source = "kalman"
-            self.last_source = "kalman"
-            self.search_state = "PREDICTING"
-        elif self.reacquire_active and self.kalman_prediction_world is not None:
-            reacq_world = tuple(self.kalman_prediction_world)
-            tracked_world_pos, kf_conf = self.tracker.update(reacq_world)
-            if tracked_world_pos is not None:
-                self.kalman_prediction_world = tuple(tracked_world_pos)
-                tracked_pos = (
-                    int(
-                        round(
-                            float(tracked_world_pos[0])
-                            - float(self.camera.pan_x)
-                            + float(self.screen_center[0])
-                        )
-                    ),
-                    int(
-                        round(
-                            float(tracked_world_pos[1])
-                            - float(self.camera.tilt_y)
-                            + float(self.screen_center[1])
-                        )
-                    ),
-                )
-            final_conf = max(float(kf_conf), 1.0)
-            source = "KALMAN-REACQUIRED"
-            self.last_source = source
-            self.last_measurement_frame = self.frame_count
-            self.search_state = "LOCKED"
-            self.reacquire_active = False
-
-        elif target_visible:
-            assist_world = (
-                float(self.camera.pan_x)
-                + (float(true_local[0]) - float(self.screen_center[0])),
-                float(self.camera.tilt_y)
-                + (float(true_local[1]) - float(self.screen_center[1])),
-            )
-            tracked_world_pos, kf_conf = self.tracker.update(assist_world)
-            if tracked_world_pos is not None:
-                tracked_pos = (
-                    int(
-                        round(
-                            float(tracked_world_pos[0])
-                            - float(self.camera.pan_x)
-                            + float(self.screen_center[0])
-                        )
-                    ),
-                    int(
-                        round(
-                            float(tracked_world_pos[1])
-                            - float(self.camera.tilt_y)
-                            + float(self.screen_center[1])
-                        )
-                    ),
-                )
-            final_conf = max(float(kf_conf), 0.90)
-            source = "sim-assist"
-            self.sim_assist_active = True
-            self.last_measurement_frame = self.frame_count
-            self.last_source = source
-        else:
-            tracked_pos = None
-            tracked_world_pos = None
-            final_conf = 0.0
-            source = "world-guide"
-        if tracked_pos is not None:
-            self.search_state = "PREDICTING" if self.beacon_hidden else "LOCKED"
-            self.tracking_elapsed = self.frame_count / 30.0
-            if self.acquisition_time is None:
-                self.acquisition_time = self.tracking_elapsed
-            if self.reacquisition_started is not None:
-                self.reacquisition_time = self.tracking_elapsed - self.reacquisition_started
-                self.reacquisition_started = None
-            self.was_locked = True
-            self.search_radius = 0.0
-            self.enlarge_radius = 0.0
-            self.roam_target = None
-            if tracked_world_pos is None:
-                tracked_world_pos = (
-                    float(self.camera.pan_x)
-                    + (float(tracked_pos[0]) - float(self.screen_center[0])),
-                    float(self.camera.tilt_y)
-                    + (float(tracked_pos[1]) - float(self.screen_center[1])),
-                )
-
-            self.last_known_world_pos = tracked_world_pos
-            if self.beacon_hidden and tracked_world_pos is not None:
-                world_error_x = float(tracked_world_pos[0]) - float(self.camera.pan_x)
-                world_error_y = float(tracked_world_pos[1]) - float(self.camera.tilt_y)
-                dx = float(np.clip(world_error_x * 0.45, -35.0, 35.0))
-                dy = float(np.clip(world_error_y * 0.45, -35.0, 35.0))
-            else:
-                dx, dy = compute_delta(tracked_pos, self.screen_center, gain=1.0)
-            self.camera.apply_delta(dx, dy)
-            error = math.hypot(
-                tracked_pos[0] - self.screen_center[0],
-                tracked_pos[1] - self.screen_center[1],
-            )
-        else:
-            self.tracking_elapsed = self.frame_count / 30.0
-            if self.was_locked and self.reacquisition_started is None:
-                self.reacquisition_started = self.tracking_elapsed
-            self.was_locked = False
-            self.search_state = "SEEKING"
-            self.search_angle = 0.0
-            self.search_radius = 0.0
-            self.enlarge_radius = 0.0
-            world_dx = (float(true_pos[0]) - self.camera.pan_x) * 0.60
-            world_dy = (float(true_pos[1]) - self.camera.tilt_y) * 0.60
-            self.camera.apply_delta(world_dx, world_dy)
-            error = float("nan")
-        dist_m = self.scene.estimate_distance_m()
-        self.frame_count += 1
-        self._stabilize_telemetry(final_conf, source)
-        self.current_dx = (
-            tracked_pos[0] - self.screen_center[0] if tracked_pos is not None else 0.0
-        )
-        self.current_dy = (
-            tracked_pos[1] - self.screen_center[1] if tracked_pos is not None else 0.0
-        )
-        self.current_error = error
-        self.current_confidence = final_conf
-        self.current_distance = dist_m
-        self.current_source = source
-        self.logger.log(
-            {
-                "fps": 30.0,
-                "source": source,
-                "confidence": final_conf,
-                "error": error,
-                "distance_m": dist_m,
-            }
-        )
-        full_display = full_frame.copy()
-        fov_color = (0, 255, 0) if tracked_pos is not None else (0, 165, 255)
-        x1 = int(self.camera.pan_x - self.camera.fov_w // 2)
-        y1 = int(self.camera.tilt_y - self.camera.fov_h // 2)
-        x2 = int(self.camera.pan_x + self.camera.fov_w // 2)
-        y2 = int(self.camera.tilt_y + self.camera.fov_h // 2)
-        cv2.rectangle(full_display, (x1, y1), (x2, y2), fov_color, 2)
-        if not self.beacon_hidden:
-            cv2.circle(full_display, tuple(map(int, true_pos)), 9, (255, 255, 0), 1)
-        if self.beacon_hidden and tracked_world_pos is not None:
-            px = int(round(float(tracked_world_pos[0])))
-            py = int(round(float(tracked_world_pos[1])))
-            KALMAN_COLOR = (180, 180, 180)  # grey = Kalman prediction
-            cv2.circle(full_display, (px, py), 12, KALMAN_COLOR, 3)
-            cv2.line(full_display, (px - 18, py), (px + 18, py), KALMAN_COLOR, 2)
-            cv2.line(full_display, (px, py - 18), (px, py + 18), KALMAN_COLOR, 2)
-        if tracked_pos is None and not self.beacon_hidden:
-            cv2.line(
-                full_display,
-                (int(self.camera.pan_x), int(self.camera.tilt_y)),
-                tuple(map(int, true_pos)),
-                (255, 255, 0),
-                1,
-            )
-        if dist_m is not None:
-            cv2.putText(
-                full_display,
-                f"FSOC RANGE: {dist_m:.1f} m",
-                (10, 22),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (255, 255, 255),
-                1,
-            )
-        cv2.putText(
-            full_display,
-            f"PATTERN: {self.scene.pattern}",
-            (10, 45),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.40,
-            (0, 255, 255),
-            1,
-        )
-        cv2.putText(
-            full_display,
-            f"STATE: {self.search_state}",
-            (10, 67),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.40,
-            fov_color,
-            1,
-        )
-        crop_display = cropped.copy()
-        draw_crosshair(crop_display, self.screen_center, color=(0, 255, 255))
-        if tracked_pos is not None:
-            bx = int(tracked_pos[0])
-            by = int(tracked_pos[1])
-            cv2.line(crop_display, self.screen_center, (bx, by), (255, 255, 0), 2)
-            cv2.circle(crop_display, (bx, by), 6, (0, 0, 255), -1)
-            cv2.circle(crop_display, (bx, by), 12, (0, 255, 0), 2)
-            pixel_error = math.hypot(
-                bx - self.screen_center[0],
-                by - self.screen_center[1],
-            )
-            cv2.putText(
-                crop_display,
-                "FSOC CAMERA / BORESIGHT",
-                (10, 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.40,
-                (255, 255, 255),
-                1,
-            )
-            cv2.putText(
-                crop_display,
-                f"BEACON | CONF {self.display_confidence:.2f}",
-                (10, 42),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.35,
-                (0, 255, 0),
-                1,
-            )
-            cv2.putText(
-                crop_display,
-                f"ERROR {pixel_error:.1f}px",
-                (10, 64),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.35,
-                (255, 255, 0),
-                1,
-            )
-            cv2.putText(
-                crop_display,
-                (f"dX {self.current_dx:+.1f}px  " f"dY {self.current_dy:+.1f}px"),
-                (10, 86),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.32,
-                (255, 255, 255),
-                1,
-            )
-            cv2.putText(
-                crop_display,
-                f"TRACK: {self.display_source}",
-                (10, 108),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.32,
-                (0, 255, 255),
-                1,
-            )
-        else:
-            cv2.putText(
-                crop_display,
-                "FSOC CAMERA / BORESIGHT",
-                (10, 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.40,
-                (255, 255, 255),
-                1,
-            )
-            cv2.putText(
-                crop_display,
-                "TARGET OUTSIDE FOV",
-                (10, 46),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.38,
-                (0, 165, 255),
-                2,
-            )
-            cv2.putText(
-                crop_display,
-                "WORLD-GUIDED ACQUISITION",
-                (10, 70),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.32,
-                (255, 255, 0),
-                1,
-            )
-        boresight_display = cropped.copy()
-        draw_crosshair(boresight_display, self.screen_center, color=(0, 255, 255))
-        if tracked_pos is not None:
-            bx = int(tracked_pos[0])
-            by = int(tracked_pos[1])
-            marker_color = (180, 180, 180) if self.beacon_hidden else (0, 255, 0)
-            cv2.line(boresight_display, self.screen_center, (bx, by), marker_color, 2)
-            cv2.circle(
-                boresight_display,
-                (bx, by),
-                18 if self.beacon_hidden else 12,
-                marker_color,
-                3,
-            )
-            if self.beacon_hidden:
-                arm = 26
-                cv2.line(
-                    boresight_display, (bx - arm, by), (bx - 10, by), marker_color, 3
-                )
-                cv2.line(
-                    boresight_display, (bx + 10, by), (bx + arm, by), marker_color, 3
-                )
-                cv2.line(
-                    boresight_display, (bx, by - arm), (bx, by - 10), marker_color, 3
-                )
-                cv2.line(
-                    boresight_display, (bx, by + 10), (bx, by + arm), marker_color, 3
-                )
-        self.boresight_label.setPixmap(
-            self._cv_to_qpixmap(boresight_display, target_label=self.boresight_label)
-        )
-        self.full_scene_label.setPixmap(
-            self._cv_to_qpixmap(full_display, target_label=self.full_scene_label)
-        )
-        self._update_pat_panel(
-            tracked_pos,
-            self.display_confidence,
-            self.display_source,
-            error,
-            dist_m,
-        )
-        if tracked_pos is not None:
-            if self.beacon_hidden:
-                state_text = "KALMAN"
-                pat_state = "PREDICTING"
-            elif self.sim_assist_active:
-                state_text = "SIM-ASSIST"
-                pat_state = "LOCKED"
-            else:
-                state_text = self.display_source
-                pat_state = "LOCKED"
-            self.system_status.setText(
-                "● SYSTEM ONLINE   |   "
-                f"PAT STATUS: {pat_state}   |   "
-                f"SOURCE: {state_text}"
-            )
-            self.system_status.setStyleSheet("""
-                QLabel {
-                    background-color: #123b35;
-                    color: #4dffd8;
-                    border: 1px solid #28d7b0;
-                    border-radius: 5px;
-                    padding: 8px;
-                    font-family: Consolas;
-                    font-weight: bold;
-                }
-            """)
-        else:
-            if self.beacon_hidden:
-                self.system_status.setText(
-                    "● SYSTEM ONLINE   |   "
-                    "PAT STATUS: PREDICTING   |   "
-                    "SOURCE: KALMAN   |   "
-                    "WAITING FOR INITIAL TRACK STATE"
-                )
-            else:
-                self.system_status.setText(
-                    "● SYSTEM ONLINE   |   "
-                    "PAT STATUS: SEEKING   |   "
-                    "WORLD-GUIDED ACQUISITION"
-                )
-            self.system_status.setStyleSheet("""
-                QLabel {
-                    background-color: #402c18;
-                    color: #ffd27a;
-                    border: 1px solid #d99b42;
-                    border-radius: 5px;
-                    padding: 8px;
-                    font-family: Consolas;
-                    font-weight: bold;
-                }
-            """)
+        self._scenario_step(frame_started)
 
     def closeEvent(self, event):
-        self.logger.close()
+        if self.media_capture is not None:
+            self.media_capture.release()
         event.accept()
 
 

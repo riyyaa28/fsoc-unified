@@ -8,6 +8,16 @@ def add_gaussian_noise(frame, sigma=15):
     return noisy
 
 
+def add_poisson_noise(frame, peak=20.0):
+    """Photon shot noise: each pixel's brightness is treated as an expected
+    photon count (scaled so white == ``peak`` photons) and resampled from a
+    Poisson distribution. Lower ``peak`` means fewer photons and more noise;
+    unlike Gaussian noise, it grows with signal brightness (variance == mean)."""
+    photons = frame.astype(np.float32) * (peak / 255.0)
+    noisy = np.random.poisson(photons).astype(np.float32) * (255.0 / peak)
+    return np.clip(noisy, 0, 255).astype(np.uint8)
+
+
 def add_fog(frame, intensity=0.3):
     fog_layer = np.full(frame.shape, 200, dtype=np.uint8)
     return cv2.addWeighted(frame, 1 - intensity, fog_layer, intensity, 0)
