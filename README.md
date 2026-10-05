@@ -8,21 +8,27 @@ The application combines a 2D camera and tracking dashboard with a 3D airspace v
 
 Add screenshots to `docs/screenshots/` using these filenames. The images will appear one below another, which stays readable on narrow screens.
 
-### Mission Control dashboard
+### 2D boresight dashboard
+<img width="1917" height="1016" alt="image" src="https://github.com/user-attachments/assets/75b55240-772b-43ed-8b00-b4924f898d18" />
 
-![2D BORE-SIGHT dashboard](docs/screenshots/mission-control.png)
+
 
 ### 3D airspace view
+<img width="1917" height="1017" alt="image" src="https://github.com/user-attachments/assets/2e626cbc-fb35-46b2-b89e-8fa24bbe8865" />
 
-![3D AIRSPACE view](docs/screenshots/airspace.png)
 
 ### Video benchmark
 
-![Video benchmark](docs/screenshots/video-benchmark.png)
+<img width="1917" height="1016" alt="image" src="https://github.com/user-attachments/assets/cb23a069-9d08-40d4-acff-c67e77d3ea83" />
+
 
 ### Scenario configuration
 
-![Scenario configuration](docs/screenshots/scenario-settings.png)
+<img width="1000" height="723" alt="image" src="https://github.com/user-attachments/assets/45289474-fe11-4e48-8334-96b56a11e334" />
+<img width="1000" height="731" alt="image" src="https://github.com/user-attachments/assets/5d8742cf-a983-436e-8f3b-ae5b7c77bc6f" />
+<img width="1000" height="717" alt="image" src="https://github.com/user-attachments/assets/62ff9139-f607-4810-aa8c-0f5577625a35" />
+<img width="1001" height="722" alt="image" src="https://github.com/user-attachments/assets/c7d4803e-8e85-4a09-bb3c-26213bf5a57b" />
+
 
 ## Ways to run the app
 
