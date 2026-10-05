@@ -42,9 +42,6 @@ class BeaconKalmanTracker:
         self.max_coast_frames = None if max_coast_frames is None else int(max_coast_frames)
         self.coast_count = 0
 
-        # Used to give the filter a useful initial velocity after the
-        # second real optical measurement. This makes the prediction
-        # visibly move rather than remaining stationary.
         self.previous_measurement = None
         self.velocity_initialized = False
 
@@ -96,10 +93,7 @@ class BeaconKalmanTracker:
         if measurement is not None:
             mx, my = float(measurement[0]), float(measurement[1])
 
-            # Estimate velocity directly from consecutive optical
-            # measurements once we have two samples. This is especially
-            # useful for the simulator because the target is moving while
-            # the PTZ camera is also moving.
+            # Initial velocity from the first two measurements.
             if self.previous_measurement is not None:
                 vx = mx - self.previous_measurement[0]
                 vy = my - self.previous_measurement[1]
@@ -131,9 +125,7 @@ class BeaconKalmanTracker:
         prediction = self.kf.predict()
         self.coast_count += 1
 
-        # None means indefinite prediction while the beacon is hidden.
-        # The dashboard can then keep the PTZ loop following the predicted
-        # world position until a real optical measurement returns.
+        # None: keep predicting for as long as the beacon is hidden.
         if (
             self.max_coast_frames is not None
             and self.coast_count > self.max_coast_frames

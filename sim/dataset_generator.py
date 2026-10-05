@@ -1,5 +1,4 @@
 import cv2
-import numpy as np
 import random
 import os
 from sim.sky import render_sky, SKY_GRADIENTS
@@ -8,14 +7,14 @@ def generate_frame_with_labels(width=640, height=480):
     mode = random.choice(list(SKY_GRADIENTS.keys()))  # day / dusk / night, randomized per image
     frame = render_sky(width, height, mode=mode).copy()
 
-    # real beacon: bright core + two concentric halo rings — the shape IS the signal now
+    # beacon: bright core with two concentric halo rings
     bx, by = random.randint(50, width - 50), random.randint(50, height - 50)
     cv2.circle(frame, (bx, by), 4, (255, 255, 255), -1)     # bright core
     cv2.circle(frame, (bx, by), 8, (200, 200, 200), 1)      # inner halo
     cv2.circle(frame, (bx, by), 14, (80, 80, 80), 1)        # faint outer halo
     labels = [(0, bx, by, 30, 30)]  # class 0 = beacon; box sized to cover the full 14px halo radius
 
-    # decoys: plain flat white/grey circles, deliberately NO halo rings — stars, glare, clouds, birds
+    # decoys: plain white / grey circles without rings (stars, glare, birds)
     n_decoys = random.randint(2, 8)
     for _ in range(n_decoys):
         dx, dy = random.randint(20, width - 20), random.randint(20, height - 20)

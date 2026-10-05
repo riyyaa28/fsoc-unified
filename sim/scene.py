@@ -35,21 +35,8 @@ class VirtualScene:
         self.n_decoys = n_decoys
         self._decoys = self._generate_decoys()
 
-        # ==========================================================
-        # BEACON VISIBILITY
-        # ==========================================================
-
-        # True = beacon is visible to the simulated camera
-        # False = beacon is hidden from the camera
-        #
-        # IMPORTANT:
         # The beacon position continues to update even when hidden.
-        #
         self.beacon_visible = True
-
-        # ==========================================================
-        # PATTERNS
-        # ==========================================================
 
         self.available_patterns = [
             "circular",
@@ -72,32 +59,23 @@ class VirtualScene:
 
         self.auto_rotate = False
 
-        # Random-motion state
         self._rx = float(width // 2)
         self._ry = float(height // 2)
 
         self._vx = 0.0
         self._vy = 0.0
 
-        # Straight-motion state
         self._straight_x = float(width // 2)
         self._straight_dir = 1
 
-        # Last actual beacon position
         self.last_beacon_position = (
             width // 2,
             height // 2
         )
 
-        # Last beacon scale
         self.last_scale = 1.0
 
-        # Last core diameter
         self.last_core_diameter_px = 8
-
-    # ==============================================================
-    # BEACON VISIBILITY CONTROL
-    # ==============================================================
 
     def hide_beacon(self):
         """
@@ -121,10 +99,6 @@ class VirtualScene:
         """
         self.beacon_visible = not self.beacon_visible
         return self.beacon_visible
-
-    # ==============================================================
-    # DECOYS
-    # ==============================================================
 
     def _generate_decoys(self):
         decoys = []
@@ -211,10 +185,6 @@ class VirtualScene:
                 )
             )
 
-    # ==============================================================
-    # TIME
-    # ==============================================================
-
     def _get_dt(self):
 
         now = time.time()
@@ -229,18 +199,10 @@ class VirtualScene:
 
         return dt
 
-    # ==============================================================
-    # BEACON MOTION
-    # ==============================================================
-
     def _raw_pattern_position(self, dt):
 
         cx = self.width // 2
         cy = self.height // 2
-
-        # ----------------------------------------------------------
-        # CIRCULAR
-        # ----------------------------------------------------------
 
         if self.pattern == "circular":
 
@@ -260,10 +222,6 @@ class VirtualScene:
                 + r * math.sin(self.t)
             )
 
-        # ----------------------------------------------------------
-        # FIGURE 8
-        # ----------------------------------------------------------
-
         elif self.pattern == "figure8":
 
             self.t += (
@@ -279,10 +237,6 @@ class VirtualScene:
                 cy
                 + 75 * math.sin(2 * self.t)
             )
-
-        # ----------------------------------------------------------
-        # STRAIGHT
-        # ----------------------------------------------------------
 
         elif self.pattern == "straight":
 
@@ -314,10 +268,6 @@ class VirtualScene:
 
             x = self._straight_x
             y = cy
-
-        # ----------------------------------------------------------
-        # RANDOM
-        # ----------------------------------------------------------
 
         elif self.pattern == "random":
 
@@ -401,10 +351,6 @@ class VirtualScene:
 
         return float(x), float(y)
 
-    # ==============================================================
-    # PATTERN CONTROL
-    # ==============================================================
-
     def set_pattern(self, new_pattern):
 
         if (
@@ -438,10 +384,6 @@ class VirtualScene:
     def disable_auto_rotate(self):
 
         self.auto_rotate = False
-
-    # ==============================================================
-    # BEACON POSITION
-    # ==============================================================
 
     def get_beacon_position(self, dt):
 
@@ -532,17 +474,9 @@ class VirtualScene:
                 int(raw_y)
             )
 
-        # Always remember the real position.
-        #
-        # This is important because the beacon must continue
-        # moving internally while hidden.
         self.last_beacon_position = position
 
         return position
-
-    # ==============================================================
-    # BEACON SCALE
-    # ==============================================================
 
     def get_beacon_scale(self, dt):
 
@@ -594,10 +528,6 @@ class VirtualScene:
 
         return self._scale
 
-    # ==============================================================
-    # DISTANCE
-    # ==============================================================
-
     def estimate_distance_m(self):
 
         if (
@@ -617,15 +547,10 @@ class VirtualScene:
             self.last_core_diameter_px
         )
 
-    # ==============================================================
-    # RENDER
-    # ==============================================================
-
     def render(self):
 
         dt = self._get_dt()
 
-        # Decoys continue moving normally.
         self._update_decoys(dt)
 
         frame = render_sky(
@@ -633,10 +558,6 @@ class VirtualScene:
             self.height,
             mode=self.sky_mode
         ).copy()
-
-        # ----------------------------------------------------------
-        # DRAW DECOYS
-        # ----------------------------------------------------------
 
         for d in self._decoys:
 
@@ -655,13 +576,8 @@ class VirtualScene:
                 -1
             )
 
-        # ----------------------------------------------------------
-        # UPDATE REAL BEACON POSITION
-        # ----------------------------------------------------------
-
         x, y = self.get_beacon_position(dt)
 
-        # Scale continues changing even when beacon is hidden.
         scale = self.get_beacon_scale(dt)
 
         self.last_scale = scale
@@ -684,14 +600,6 @@ class VirtualScene:
         self.last_core_diameter_px = (
             core_r * 2
         )
-
-        # ----------------------------------------------------------
-        # IMPORTANT:
-        #
-        # Only draw the beacon when it is visible.
-        #
-        # The actual position STILL updates above.
-        # ----------------------------------------------------------
 
         if self.beacon_visible:
 

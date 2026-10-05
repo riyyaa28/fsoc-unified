@@ -1,22 +1,17 @@
 
 import * as THREE from "../../node_modules/three/build/three.module.js";
 
-// ============================================================
-// FSOC 3D AIRSPACE
-// ============================================================
+// ---- FSOC 3D AIRSPACE ----
 
-// Scene
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x06152a);
 scene.fog = new THREE.FogExp2(0x06152a, 0.00035);
 
-// Camera
 const camera = new THREE.PerspectiveCamera(52, 1, 0.1, 5000);
 const cameraTarget = new THREE.Vector3(0, 80, 0);
 camera.position.set(700, 420, 780);
 camera.lookAt(cameraTarget);
 
-// Renderer
 let renderer;
 
 try {
@@ -35,7 +30,6 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.35;
 
-// Viewport
 const sceneContainer = document.getElementById("scene");
 
 if (!sceneContainer) {
@@ -89,9 +83,7 @@ requestAnimationFrame(() => {
     requestAnimationFrame(resizeRenderer);
 });
 
-// ============================================================
-// CAMERA CONTROLS
-// ============================================================
+// ---- CAMERA CONTROLS ----
 
 const orbit = new THREE.Spherical();
 const orbitOffset = new THREE.Vector3();
@@ -225,9 +217,7 @@ canvas.addEventListener("wheel", (event) => {
     controls.update();
 }, { passive: false });
 
-// ============================================================
-// LIGHTING
-// ============================================================
+// ---- LIGHTING ----
 
 scene.add(new THREE.HemisphereLight(0x6ca8d8, 0x020611, 2));
 
@@ -276,9 +266,7 @@ secondaryGrid.material.transparent = true;
 secondaryGrid.material.opacity = 0.2;
 scene.add(secondaryGrid);
 
-// ============================================================
-// STARS
-// ============================================================
+// ---- STARS ----
 
 const starPositions = new Float32Array(1100 * 3);
 
@@ -305,9 +293,7 @@ const stars = new THREE.Points(
 );
 scene.add(stars);
 
-// ============================================================
-// DRONE MODEL
-// ============================================================
+// ---- DRONE MODEL ----
 
 function createDrone() {
     const drone = new THREE.Group();
@@ -404,7 +390,6 @@ function enforceSeparation() {
     }
 }
 
-// Receiver beacon
 const beacon = new THREE.Group();
 
 const beaconCore = new THREE.Mesh(
@@ -482,9 +467,7 @@ function updateDecoys(deltaTime, elapsed) {
     });
 }
 
-// ============================================================
-// RECEIVER RINGS
-// ============================================================
+// ---- RECEIVER RINGS ----
 
 function createRing(inner, outer, opacity) {
     const ring = new THREE.Mesh(
@@ -522,9 +505,7 @@ const verticalRing = new THREE.Mesh(
 verticalRing.rotation.y = Math.PI / 2;
 rxDrone.add(verticalRing);
 
-// ============================================================
-// COMMUNICATION BEAM
-// ============================================================
+// ---- COMMUNICATION BEAM ----
 
 const beamCore = new THREE.Mesh(
     new THREE.CylinderGeometry(3.5, 2, 1, 16, 1, true),
@@ -561,9 +542,7 @@ const beamPulse = new THREE.Mesh(
 
 scene.add(beamCore, beamGlow, beamPulse);
 
-// ============================================================
-// ENVIRONMENT CONTROLS
-// ============================================================
+// ---- ENVIRONMENT CONTROLS ----
 
 const disturbanceLevels = {
     fog: 0,
@@ -631,9 +610,7 @@ document.querySelectorAll(".environment-item[data-effect]").forEach((control) =>
 
 window.fsocSetDisturbanceLevel = setDisturbance;
 
-// ============================================================
-// SIMULATION
-// ============================================================
+// ---- SIMULATION ----
 
 let running = true;
 let pattern = "circular";
@@ -844,9 +821,7 @@ function updatePattern(deltaTime) {
     enforceSeparation();
 }
 
-// ============================================================
-// BEAM UPDATE
-// ============================================================
+// ---- BEAM UPDATE ----
 
 const beamAxis = new THREE.Vector3(0, 1, 0);
 const beamQuaternion = new THREE.Quaternion();
@@ -924,9 +899,7 @@ function updateBeam(elapsed) {
     );
 }
 
-// ============================================================
-// UI ELEMENTS
-// ============================================================
+// ---- UI ELEMENTS ----
 
 function findElement(...ids) {
     for (const id of ids) {
@@ -1672,9 +1645,7 @@ function setBeaconHidden(hidden) {
     recordActivity("BEACON", beaconHidden ? "Beacon hidden; receiver path remains active" : "Beacon visible; tracking can reacquire target");
 }
 
-// ============================================================
-// AIRCRAFT HUD
-// ============================================================
+// ---- AIRCRAFT HUD ----
 
 function updateAircraftMarker(drone, marker) {
     if (!marker || !aircraftHud) return;
@@ -1737,9 +1708,7 @@ function drawAircraftOverlay() {
     updateAircraftMarker(rxDrone, rxMarker);
 }
 
-// ============================================================
-// TRACKING AND TELEMETRY
-// ============================================================
+// ---- TRACKING AND TELEMETRY ----
 
 const kalmanPosition = beacon.getWorldPosition(new THREE.Vector3());
 const kalmanVelocity = new THREE.Vector3();
@@ -1900,9 +1869,7 @@ function updateBeaconTracking(deltaTime, elapsed) {
     beacon.scale.setScalar(0.85 + Math.sin(elapsed * 5) * 0.12);
 }
 
-// ============================================================
-// BUTTONS AND PATTERN SELECTION
-// ============================================================
+// ---- BUTTONS AND PATTERN SELECTION ----
 
 if (startButton) {
     startButton.addEventListener("click", () => {
@@ -2011,9 +1978,7 @@ if (beaconToggle) {
     });
 }
 
-// ============================================================
-// PYTHON / DASHBOARD API
-// ============================================================
+// ---- PYTHON / DASHBOARD API ----
 
 window.fsoc = {
     setReceiverPosition(x, y, z = 0) {
@@ -2069,9 +2034,7 @@ window.fsoc = {
     }
 };
 
-// ============================================================
-// ANIMATION LOOP
-// ============================================================
+// ---- ANIMATION LOOP ----
 
 let previousTime = performance.now() / 1000;
 let elapsedTime = 0;
@@ -2149,7 +2112,6 @@ function animate(now) {
     }
 }
 
-// Initial camera and render
 controls.update();
 resizeRenderer();
 updateBeam(0);

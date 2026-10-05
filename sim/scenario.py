@@ -90,7 +90,7 @@ class ScenarioConfig:
     jitter_px: int = 0                      # +/- px per frame (spec max 20)
     atmosphere: str = "clear"
     atmosphere_strength: float = 0.5        # 0..1
-    platform_motion: str = "none"
+    platform_motion: str = "linear"           # spec default (amount 0 = off until set)
     platform_px_per_frame: float = 0.0      # spec max 20
     occlusions: str = ""                    # "4-5, 10-11.5" (seconds, beacon hidden)
     # run
@@ -576,10 +576,12 @@ class PoissonSampler:
     probabilities, so a sample is one table lookup instead of a call into the
     generic sampler (about 20 ms per 640 x 480 frame). Tail probabilities
     below 1 / BINS are folded into the last bin.
+
+    The table is stored as a small float image (rows: grey level, columns:
+    probability bin) and the lookup for a whole frame is one cv2.remap call,
+    which OpenCV runs multithreaded (about 1 ms per 640 x 480 frame).
     """
 
-    # 1024 bins of uint16 photon counts keep the table (512 KB) in the CPU
-    # cache even when a frame spans every grey level (e.g. the dusk sky).
     BINS = 1024
     _cache = {}
 
@@ -596,7 +598,8 @@ class PoissonSampler:
             cdf = np.cumsum(np.exp(log_pmf))
             table[level] = np.minimum(np.searchsorted(cdf, probabilities * cdf[-1]), 65535)
         self.table = table
-        self.flat = table.ravel()
+        # Photon counts converted back to grey levels, ready for cv2.remap.
+        self.lookup = table.astype(np.float32) * np.float32(self.scale)
 
     @classmethod
     def get(cls, peak):
@@ -606,12 +609,14 @@ class PoissonSampler:
         return cls._cache[key]
 
     def sample(self, image, rng, bins=None):
-        index = np.clip(image + 0.5, 0, 255).astype(np.int32)
-        index *= self.BINS
-        index += bins if bins is not None else rng.integers(0, self.BINS, image.shape, dtype=np.int32)
-        out = np.take(self.flat, index).astype(np.float32)
-        out *= self.scale                    # photon counts back to grey levels
-        return out
+        """image: float32 grey levels. bins: float32 field, uniform in
+        [-0.5, BINS - 0.5), one value per pixel (drawn here if not given)."""
+        if bins is None:
+            bins = rng.uniform(-0.5, self.BINS - 0.5, image.shape).astype(np.float32)
+        # output(y, x) = lookup[round(image(y, x)), round(bins(y, x))];
+        # BORDER_REPLICATE clamps levels outside 0..255 to the end rows.
+        return cv2.remap(self.lookup, bins, np.asarray(image, np.float32), cv2.INTER_NEAREST,
+                         borderMode=cv2.BORDER_REPLICATE)
 
 
 class NoiseSource:
@@ -636,7 +641,8 @@ class NoiseSource:
     def fields(self, cfg, shape):
         out = {}
         if cfg.poisson:
-            out["poisson_bins"] = cv2.randu(self._buffer("poisson", shape, np.int32), 0, PoissonSampler.BINS)
+            out["poisson_bins"] = cv2.randu(self._buffer("poisson", shape, np.float32),
+                                            -0.5, PoissonSampler.BINS - 0.5)
         if cfg.gaussian_sigma > 0:
             out["gaussian"] = cv2.randn(self._buffer("gaussian", shape, np.float32), 0.0, 1.0)
         if cfg.salt_pepper_pct > 0:
@@ -647,17 +653,24 @@ class NoiseSource:
 def _atmosphere(image, cfg, rain_layer=None):
     """Contrast / brightness effects of the atmosphere (grey or colour image)."""
     s = cfg.atmosphere_strength
+
+    def mix(gain, offset):                   # image * gain + offset, in one OpenCV pass
+        return cv2.addWeighted(image, gain, image, 0.0, offset)
+
     if cfg.atmosphere == "haze":
-        return image * (1 - 0.55 * s) + 150.0 * 0.55 * s
+        return mix(1 - 0.55 * s, 150.0 * 0.55 * s)
     if cfg.atmosphere == "fog":
-        return cv2.GaussianBlur(image * (1 - 0.8 * s) + 175.0 * 0.8 * s, (0, 0), 0.8 + 1.5 * s)
+        return cv2.GaussianBlur(mix(1 - 0.8 * s, 175.0 * 0.8 * s), (0, 0), 0.8 + 1.5 * s)
     if cfg.atmosphere == "rain":
-        image = image * (1 - 0.3 * s) + 90.0 * 0.3 * s
+        image = mix(1 - 0.3 * s, 90.0 * 0.3 * s)
         if rain_layer is not None:
-            image = image + (rain_layer[:, :, None] if image.ndim == 3 else rain_layer) * (60.0 * s)
+            if image.ndim == 3:
+                image = image + rain_layer[:, :, None] * (60.0 * s)
+            else:
+                image = cv2.scaleAdd(rain_layer, 60.0 * s, image)
         return image
     if cfg.atmosphere == "low light":
-        return image * (1 - 0.8 * s)
+        return mix(1 - 0.8 * s, 0.0)
     return image
 
 
@@ -743,23 +756,25 @@ def apply_disturbances(image, cfg, rng, rain_layer=None, fields=None):
     fields: optional pre-drawn random fields (NoiseSource.fields); any that are
     missing are drawn from rng here.
     """
+    # Each step is a single OpenCV call (multithreaded C++, no numpy
+    # temporaries), which keeps the whole chain near 3 ms per camera frame.
     fields = fields or {}
-    image = _atmosphere(image, cfg, rain_layer)
+    image = _atmosphere(np.asarray(image, np.float32), cfg, rain_layer)
     if cfg.poisson:
         image = PoissonSampler.get(cfg.poisson_peak).sample(image, rng, fields.get("poisson_bins"))
     if cfg.gaussian_sigma > 0:
         noise = fields.get("gaussian")
         noise = rng.standard_normal(image.shape, dtype=np.float32) if noise is None else noise
-        noise *= cfg.gaussian_sigma
-        noise += image
-        image = noise
-    out = np.clip(image, 0, 255).astype(np.uint8)
+        image = cv2.scaleAdd(noise, float(cfg.gaussian_sigma), np.asarray(image, np.float32))
+    # Clip to 0..255 and truncate to uint8: negatives to zero, then a
+    # saturating conversion (the -0.5 makes its rounding a truncation).
+    out = cv2.convertScaleAbs(cv2.threshold(image, 0, 0, cv2.THRESH_TOZERO)[1], alpha=1.0, beta=-0.5)
     if cfg.salt_pepper_pct > 0:
         u = fields.get("salt_pepper")
         u = rng.random(out.shape, dtype=np.float32) if u is None else u
         p = cfg.salt_pepper_pct / 200.0
-        out[u < p] = 0
-        out[u > 1 - p] = 255
+        out = cv2.bitwise_and(out, cv2.compare(u, p, cv2.CMP_GE))      # pepper: u < p -> 0
+        out = cv2.bitwise_or(out, cv2.compare(u, 1 - p, cv2.CMP_GT))   # salt: u > 1 - p -> 255
     return out
 
 
@@ -787,6 +802,124 @@ class SpiralSearch:
             # Whole screen covered: restart from the screen centre.
             self.centre, self.theta = self.screen_centre.copy(), 0.0
         return self.centre + r * np.array([math.cos(self.theta), math.sin(self.theta)])
+
+
+class BeaconMemory:
+    """Where the beacon should be while it cannot be seen (screen px).
+
+    Fed the Kalman-filtered position and velocity on every measured frame.
+    Once the track is lost it keeps extrapolating that state frame by frame,
+    reflected at the screen edges, so the camera can keep pointing where the
+    beacon has gone. Several motion models are tried - straight line from the
+    current velocity, constant turn rate, mean velocity over the last second -
+    and the one that best predicts the recent track (scored by predicting the
+    last BACKTEST frames from the state before them) is used for pointing.
+    The gate is everywhere the beacon could have reached since its last fix
+    (REACH x its speed); only candidates inside it may re-acquire the track,
+    so a decoy elsewhere cannot steal it while the beacon is hidden.
+    """
+
+    HISTORY = 90                   # measured frames kept
+    TURN_FRAMES = 12               # frames used for the turn rate
+    MEAN_FRAMES = 30               # window of the mean-velocity model
+    BACKTEST = 30                  # horizon the models are scored over
+    MAX_TURN = 0.08                # rad per frame
+    MAX_S = 8.0                    # prediction given up after this long
+    REACH = 1.5                    # fastest the beacon may have moved, x its observed speed
+
+    def __init__(self, cfg, fps):
+        self.cfg, self.fps = cfg, fps
+        self.lo = np.zeros(2)
+        self.hi = np.array([float(cfg.screen_width), float(cfg.screen_height)])
+        self.history = []          # (frame, pos, vel) of recent measured frames
+        self.pos = None
+        self.vel = np.zeros(2)
+        self.turn = 0.0
+        self.model = None
+        self.speed = 0.0
+        self.frame = 0
+        self.lost_frames = 0
+
+    def observe(self, frame, pos, vel):
+        self.history = self.history[-(self.HISTORY - 1):] + [(frame, np.array(pos, float), np.array(vel, float))]
+        self.pos = None            # tracking again: no prediction running
+
+    def _models(self, history):
+        """Candidate extrapolations from the end of history: name -> (pos, vel, turn)."""
+        frame, pos, vel = history[-1]
+        models = {"straight": (pos, vel, 0.0)}
+        recent = [e for e in history if e[0] >= frame - self.TURN_FRAMES]
+        if len(recent) >= 4 and np.hypot(*vel) > 0.3:
+            angles = np.unwrap([math.atan2(v[1], v[0]) for _, _, v in recent])
+            turn = (angles[-1] - angles[0]) / max(recent[-1][0] - recent[0][0], 1)
+            models["turn"] = (pos, vel, float(np.clip(turn, -self.MAX_TURN, self.MAX_TURN)))
+        older = [e for e in history if e[0] <= frame - self.MEAN_FRAMES]
+        if older:
+            f0, p0, _ = older[-1]
+            models["mean"] = (pos, (pos - p0) / (frame - f0), 0.0)
+        return models
+
+    def _step(self, pos, vel, turn):
+        c, s = math.cos(turn), math.sin(turn)
+        vel = np.array([c * vel[0] - s * vel[1], s * vel[0] + c * vel[1]])
+        pos = pos + vel
+        for axis in (0, 1):
+            if not self.lo[axis] <= pos[axis] <= self.hi[axis]:
+                vel[axis] = -vel[axis]                 # bounce off the screen edge
+                pos[axis] = float(np.clip(pos[axis], self.lo[axis], self.hi[axis]))
+                turn = -turn
+        return pos, vel, turn
+
+    def _choose(self):
+        """Model that best predicts the last BACKTEST frames of the track."""
+        models = self._models(self.history)
+        last_frame, last_pos, _ = self.history[-1]
+        anchor = [i for i, e in enumerate(self.history) if e[0] <= last_frame - self.BACKTEST]
+        if not anchor:
+            return "turn" if "turn" in models else "straight", models
+        past = self._models(self.history[:anchor[-1] + 1])
+        errors = {}
+        for name, (pos, vel, turn) in past.items():
+            if name not in models:
+                continue
+            for _ in range(last_frame - self.history[anchor[-1]][0]):
+                pos, vel, turn = self._step(pos, vel, turn)
+            errors[name] = math.hypot(*(pos - last_pos))
+        return min(errors, key=errors.get), models
+
+    def start(self, frame):
+        """Track lost at `frame`: extrapolate from the last measured state."""
+        if not self.history:
+            return
+        self.model, models = self._choose()
+        pos, vel, self.turn = models[self.model]
+        self.pos, self.vel = pos.copy(), vel.copy()
+        self.speed = float(np.mean([np.hypot(*v) for _, _, v in self.history[-self.TURN_FRAMES:]]))
+        self.fix = pos.copy()
+        self.frame, self.lost_frames = self.history[-1][0], 0
+        self.advance(frame)
+
+    @property
+    def active(self):
+        return self.pos is not None and self.lost_frames <= self.MAX_S * self.fps
+
+    def advance(self, frame):
+        """Extrapolate up to `frame`."""
+        while self.pos is not None and self.frame < frame:
+            self.pos, self.vel, self.turn = self._step(self.pos, self.vel, self.turn)
+            self.frame += 1
+            self.lost_frames += 1
+
+    def velocity(self):
+        return self.vel.copy()
+
+    def radius(self):
+        cfg = self.cfg
+        base = 3 * cfg.target_size_px + 2 * cfg.jitter_px + cfg.platform_px_per_frame + 20
+        return base + self.REACH * max(self.speed, cfg.target_speed_px_s / self.fps) * self.lost_frames
+
+    def contains(self, point):
+        return self.active and math.hypot(point[0] - self.fix[0], point[1] - self.fix[1]) <= self.radius()
 
 
 class WideFieldFinder:
@@ -855,7 +988,6 @@ class ScenarioRunner:
         self.dt = 1.0 / self.fps
         self.v_max = np.array([cfg.max_pan_deg_s * cfg.px_per_deg_x / self.fps,
                                cfg.max_tilt_deg_s * cfg.px_per_deg_y / self.fps])
-        # The boresight can point at any point of the screen.
         self.cam_min = np.zeros(2)
         self.cam_max = np.array([float(cfg.screen_width), float(cfg.screen_height)])
         self.camera = np.array([cfg.screen_width / 2.0, cfg.screen_height / 2.0])   # spec: start at centre
@@ -870,6 +1002,7 @@ class ScenarioRunner:
                                        (cfg.fov_x_deg, cfg.fov_y_deg), {})
         self.metrics.screen_size = (cfg.screen_width, cfg.screen_height)
         self.search = SpiralSearch(self.camera, cfg, 0.9 * float(self.v_max.min()))
+        self.memory = BeaconMemory(cfg, self.fps)
         self.finder = WideFieldFinder(cfg, self.scene, self.fps) if cfg.acquisition_aid == "wide-field" else None
         if self.finder is not None and not self.finder.usable():
             # Too small for the finder's resolution: it could not tell the beacon
@@ -937,10 +1070,19 @@ class ScenarioRunner:
 
         # 2. Detection / tracking in the camera image. Without a camera lock the
         #    wide-field finder looks for the beacon over the whole screen.
+        #    While the beacon is lost, the Kalman memory says where it should be;
+        #    only candidates (and finder cues) inside its gate may re-acquire.
         hint = None
         self.finder_result = None
+        pointing = self.camera - half            # encoder reading: jitter is not known
+        self.memory.advance(index)
+        if self.memory.active:
+            mx, my = self.memory.fix - pointing
+            hint = (mx, my, self.memory.radius())
         if self.finder is not None and self.tracker.state != LOCKED:
             self.finder_result = self.finder.process(visible, self.noise, self.rng, index)
+            if self.finder_result is not None and self.memory.active and not self.memory.contains(self.finder_result):
+                self.finder_result = None        # not where the beacon can be
             if self.finder_result is not None:
                 fx, fy = self.finder_result
                 hint = (fx - origin[0], fy - origin[1], 4 * self.finder.scale + 3 * cfg.target_size_px)
@@ -962,17 +1104,28 @@ class ScenarioRunner:
             aim = filtered if filtered is not None else np.array([result.x, result.y])
             error = aim - half
             command = error * self.FOLLOW_GAIN + self.tracker.velocity()
+            if result.measured and result.state == LOCKED:
+                self.memory.observe(index, pointing + aim, self.tracker.velocity())
             self._was_tracking = True
         else:
             if self._was_tracking:
-                # Track lost: search around the last predicted position.
+                # Track lost: keep predicting where the beacon has gone; the
+                # spiral search is the fallback once the prediction expires.
                 predicted = self.camera + (self.tracker.last_position() - half
                                            if self.tracker.last_position() is not None else 0)
                 self.search = SpiralSearch(predicted, cfg, 0.9 * float(self.v_max.min()))
+                self.memory.start(index)
                 self._was_tracking = False
             if self.finder_result is not None:
                 command = np.array(self.finder_result) - self.camera      # slew to the finder's target
+            elif self.memory.active:
+                # Follow the prediction so the beacon is in view when it reappears.
+                command = (self.memory.pos - self.camera) * self.FOLLOW_GAIN + self.memory.velocity()
             else:
+                if self.memory.pos is not None:
+                    # Prediction too old to trust: search around where it ended.
+                    self.search = SpiralSearch(self.memory.pos, cfg, 0.9 * float(self.v_max.min()))
+                    self.memory.pos = None
                 command = self.search.next_point() - self.camera
         command = np.clip(command, -self.v_max, self.v_max)
         drift = self.platform.step()

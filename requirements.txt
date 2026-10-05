@@ -1,52 +1,27 @@
-altgraph==0.17.5
-anyio==4.15.1
-certifi==2026.7.22
-charset-normalizer==3.5.1
-cloudpickle==3.1.2
-colorama==0.4.6
-contourpy==1.3.3
-cycler==0.12.1
-filelock==3.32.6
-fonttools==4.65.0
-fsspec==2026.7.0
-h11==0.16.0
-httpcore==1.0.9
-httpx==0.28.1
-idna==3.19
-Jinja2==3.1.6
-kiwisolver==1.5.1
-MarkupSafe==3.0.3
-matplotlib==3.11.1
-mpmath==1.3.0
-networkx==3.6.1
+# FSOC Coarse Alignment Control Center - Python dependencies
+#
+# Only the packages the code imports directly are listed; pip installs their
+# own dependencies automatically. This means the virtual environment folder
+# (venv/) does not need to be shipped: leave it out of the zip and recreate it
+# on the target computer with
+#
+#     python -m venv venv
+#     venv\Scripts\activate
+#     pip install -r requirements.txt
+#
+# Versions are the ones the application was tested with (Python 3.13, Windows).
+
 numpy==2.5.3
-nvidia-ml-py==13.610.43
 opencv-python==5.0.0.93
-packaging==26.3
-pefile==2024.8.26
-pillow==12.3.0
-polars==1.44.2
-polars-runtime-32==1.44.2
-psutil==7.2.2
-pyinstaller==6.22.2
-pyinstaller-hooks-contrib==2026.7
-pyparsing==3.3.2
+
+# GUI: main window, 2D tab and the embedded browser for the 3D tab
 PyQt5==5.15.11
-PyQt5-Qt5==5.15.2
-PyQt5_sip==12.19.0
 PyQtWebEngine==5.15.7
-pyqtgraph==0.14.0
-python-dateutil==2.9.0.post0
-pywin32-ctypes==0.2.3
-PyYAML==6.0.3
-requests==2.34.2
-setuptools==84.0.0
-six==1.17.0
-sympy==1.14.0
+
+# YOLO beacon detector (beacon_yolo.pt); ultralytics pulls in torchvision,
+# matplotlib, polars, etc. by itself
 torch==2.14.0
-torchvision==0.29.0
-typing_extensions==4.16.0
 ultralytics==8.4.147
-ultralytics-platform==0.1.39
-ultralytics-thop==2.1.6
-urllib3==2.7.0
+
+# Only needed to build the standalone executable (pyinstaller main.spec):
+# pyinstaller==6.22.2

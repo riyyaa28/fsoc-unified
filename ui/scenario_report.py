@@ -31,7 +31,7 @@ def write_scenario_report(path, runner, events=None, complete=True):
         ("ACQUISITION", _fmt(s.get("acquisition_time_s"), 2, " s")),
         ("LOCK RETENTION", _fmt(s.get("lock_retention_pct"), 1, " %")),
         ("TRACKING ERROR", _fmt(s.get("tracking_error_mean_px"), 1, " px")),
-        ("FRAME RATE", _fmt(s.get("frame_fps"), 0, " fps")),
+        ("PROCESSING RATE", _fmt(s.get("frame_fps"), 0, " fps")),
     ])
 
     # 1 ----------------------------------------------------------------
@@ -49,8 +49,9 @@ def write_scenario_report(path, runner, events=None, complete=True):
             f"{_fmt(s.get('lock_retention_pct'), 1, ' %')} of frames in which it was visible. "
             f"Centroiding error against the simulated truth had an RMSE of {_fmt(s.get('rmse_px'), 3, ' px')}, "
             f"and the beacon stayed on average {_fmt(s.get('tracking_error_mean_px'), 2, ' px')} from the camera "
-            f"boresight. The loop ran at {_fmt(s.get('frame_fps'), 0, ' fps')} end to end "
-            f"(tracker {_fmt(s.get('processing_ms_mean'), 2, ' ms')} per frame)."
+            f"boresight. Simulating and tracking a frame took on average {_fmt(s.get('frame_ms_mean'), 1, ' ms')} "
+            f"({_fmt(s.get('frame_fps'), 0, ' fps')} processing rate; tracker alone "
+            f"{_fmt(s.get('processing_ms_mean'), 2, ' ms')})."
         )
         report.paragraph(text)
 
@@ -93,7 +94,7 @@ def write_scenario_report(path, runner, events=None, complete=True):
         ["Tracking error (95th pct / max)",
          f"{_fmt(s.get('tracking_error_p95_px'), 2)} / {_fmt(s.get('tracking_error_max_px'), 2, ' px')}", "10 px"],
         ["Frames with tracking error <= 10 px", _fmt(s.get("tracking_within_10px_pct"), 1, " %"), "--"],
-        ["Frame rate (end to end)", _fmt(s.get("frame_fps"), 1, " fps"), "30 Hz camera update"],
+        ["Processing rate (simulation + tracking)", _fmt(s.get("frame_fps"), 1, " fps"), "30 Hz camera update"],
         ["Processing time (mean / p95)",
          f"{_fmt(s.get('processing_ms_mean'), 2)} / {_fmt(s.get('processing_ms_p95'), 2, ' ms')}", "50 ms (20 FPS)"],
     ])

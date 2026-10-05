@@ -67,6 +67,7 @@ class _Detection:
     source: str = "MATCHED"
     contrast: float = 0.0          # matched-filter level above background
     level: float = 0.0             # absolute brightness of the spot's core
+    similarity: float = None       # match to the learned beacon appearance
 
 
 def _matched_response(image, k):
@@ -82,8 +83,8 @@ def _matched_response(image, k):
 def _robust_stats(values):
     """Median and MAD-based sigma of a float array (sub-sampled for speed)."""
     flat = values.ravel()
-    if flat.size > 40000:
-        flat = flat[:: flat.size // 40000 + 1]
+    if flat.size > 20000:
+        flat = flat[:: flat.size // 20000 + 1]
     med = float(np.median(flat))
     sigma = 1.4826 * float(np.median(np.abs(flat - med)))
     return med, sigma
@@ -104,15 +105,22 @@ class VideoBeaconTracker:
     YOLO_EVERY = 5                 # YOLO fallback on every Nth unsuccessful search frame
     EDGE_MARGIN_FACTOR = 1.0       # while acquiring, ignore candidates this many beacon widths from the edge
     MAX_INNOVATION_RMS = 25.0      # px; covers the spec's +/-20 px jitter with margin
-    # Designated-target identification by absolute brightness (simulation,
-    # where the beacon's apparent brightness is known). On a sky whose
-    # brightness varies (e.g. a gradient), contrast alone can rank a dim
-    # decoy on a dark patch above the beacon on a bright patch; the beacon's
-    # core, however, is always the brightest spot.
+    # Simulation: the beacon's core brightness is known, so it is identified as
+    # the brightest spot (contrast alone misranks spots on a sky gradient).
     identify_by_level = False
     expected_level = None          # apparent core brightness of the beacon, if known
     DECOY_LEVEL_RATIO = 0.8        # candidates dimmer than this x expected_level are decoys
-    CANDIDATES = 4                 # peaks examined per search when identifying by level
+    CANDIDATES = 4                 # peaks examined per search when identifying by level / appearance
+    # Video: a high-passed template of the locked beacon (its shape, e.g. halo
+    # rings) rejects candidates that look different. It is used only once the
+    # locked beacon keeps matching it well (in heavy noise it may never be).
+    APPEARANCE = True
+    APPEARANCE_FRAMES = 2          # locked frames learned before the check starts
+    APPEARANCE_RELIABLE = 0.75     # typical beacon similarity needed to start it
+    APPEARANCE_MIN = 0.5           # floor of the similarity threshold
+    APPEARANCE_MARGIN = 0.15       # threshold = beacon's typical similarity minus this
+    APPEARANCE_LEARN = 0.1         # template update rate
+    APPEARANCE_ALIGN = 3           # px of misalignment searched when matching
     # Multi-frame integration (track-before-detect) while not locked: see
     # _integrate(). Lets acquisition find a beacon too faint to stand out
     # from the noise in any single frame.
@@ -136,19 +144,17 @@ class VideoBeaconTracker:
         self._yolo_executor = ThreadPoolExecutor(max_workers=1) if yolo is not None and yolo_async else None
         self._yolo_future = None
         self._camera_shift = np.zeros(2)     # camera motion since the pending YOLO frame
+        self._designated = None              # (YOLO beacon position or None, age in frames)
         self._kf = None
         self.state = SEARCH
         self.confirm_count = 0
         self.coast_count = 0
         self.last_detection = None
-        # RMS distance between prediction and measurement. It captures
-        # camera jitter / platform motion the constant-velocity model cannot
-        # predict, and widens the gate accordingly. It describes the video,
-        # so it survives track restarts.
+        # RMS prediction error: widens the gate for jitter the model cannot
+        # predict. Kept across track restarts (it describes the video).
         self.innovation_rms = 0.0
-        # Contrast of the designated beacon, learned while locked. Dimmer
-        # spots (decoys) are rejected; the estimate decays while nothing is
-        # tracked so a real change (e.g. thicker fog) is re-learned.
+        # Learned contrast of the beacon; dimmer spots are decoys. It decays while
+        # searching, so a real change (e.g. thicker fog) is re-learned.
         self.beacon_contrast = 0.0
         # Integrated detection-evidence map (acquisition image scale) and the
         # known camera motion since it was last updated.
@@ -156,10 +162,16 @@ class VideoBeaconTracker:
         self._evidence_shift = np.zeros(2)
         self._evidence_frames = 0
         self._frame_response = None
+        self._gray = None
+        self._reset_appearance()
 
-    # ------------------------------------------------------------------
-    # public API
-    # ------------------------------------------------------------------
+    def _reset_appearance(self):
+        self._template = None
+        self._template_sigma = 2.0
+        self._appearance_sim = None    # typical similarity of the accepted beacon
+        self._appearance_count = 0     # locked frames learned into the template
+
+    # -- public API --------------------------------------------------------
 
     def reset(self):
         self._kf = None
@@ -170,12 +182,14 @@ class VideoBeaconTracker:
         self.innovation_rms = 0.0
         self.beacon_contrast = 0.0
         self._evidence = None
+        self._reset_appearance()
 
     def process(self, frame, index, hint=None):
         """Track one frame. hint=(x, y, radius): while acquiring, only accept
         candidates within radius px of (x, y) (e.g. from a wide-field finder)."""
         started = time.perf_counter()
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self._gray = gray
         prediction = self._predict()
         self._frame_response = None
         if self.INTEGRATE and self.state != LOCKED:
@@ -219,9 +233,8 @@ class VideoBeaconTracker:
             self.beacon_contrast *= 0.98
         if detection is not None and prediction is not None and self._kf is not None:
             residual = math.hypot(detection.x - prediction[0], detection.y - prediction[1])
-            # Capped: the gate grows with 3x this estimate, so an accepted
-            # residual near the gate edge would otherwise grow it ~2x per frame
-            # and one noise blob could open the window to the whole frame.
+            # Capped, or one noise blob near the gate edge could grow the gate
+            # every frame until it covers the whole frame.
             self.innovation_rms = min(self.MAX_INNOVATION_RMS,
                                       math.sqrt(0.85 * self.innovation_rms ** 2 + 0.15 * residual ** 2))
 
@@ -270,9 +283,7 @@ class VideoBeaconTracker:
             return None
         return np.array([float(self._kf.statePost[0, 0]), float(self._kf.statePost[1, 0])])
 
-    # ------------------------------------------------------------------
-    # state machine
-    # ------------------------------------------------------------------
+    # -- state machine -----------------------------------------------------
 
     def _update_state(self, detection, index):
         time_s = index / self.fps
@@ -287,6 +298,8 @@ class VideoBeaconTracker:
             else:
                 self.confirm_count += 1
                 self.state = LOCKED if self.confirm_count >= self.CONFIRM_FRAMES else TENTATIVE
+            if self.state == LOCKED:
+                self._learn_appearance(detection)
             if self.state == LOCKED and detection.contrast > 0:
                 self.beacon_contrast = (detection.contrast if self.beacon_contrast <= 0
                                         else 0.9 * self.beacon_contrast + 0.1 * detection.contrast)
@@ -305,9 +318,7 @@ class VideoBeaconTracker:
         self._kf = None
         return FrameResult(index, time_s, SEARCH, False)
 
-    # ------------------------------------------------------------------
-    # Kalman filter (constant velocity, pixel units, dt = 1 frame)
-    # ------------------------------------------------------------------
+    # -- Kalman filter (constant velocity, pixel units, dt = 1 frame) ------
 
     def _init_kf(self, x, y):
         kf = cv2.KalmanFilter(4, 2)
@@ -329,9 +340,7 @@ class VideoBeaconTracker:
         if self._kf is None:
             self._init_kf(x, y)
         else:
-            # Measurement noise follows the observed residuals: with camera
-            # jitter the filter smooths more, so its position and velocity
-            # (used for pointing) are not thrown around by the shake.
+            # Measurement noise follows the residuals: smoother output under jitter.
             variance = max(0.5, 0.5 * self.innovation_rms ** 2)
             self._kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * variance
             self._kf.correct(np.array([[x], [y]], np.float32))
@@ -362,9 +371,7 @@ class VideoBeaconTracker:
         margin = self.SNR_MARGIN if margin is None else margin
         return max(floor, math.sqrt(2.0 * math.log(samples)) + margin)
 
-    # ------------------------------------------------------------------
-    # detection
-    # ------------------------------------------------------------------
+    # -- detection ---------------------------------------------------------
 
     def _kernel(self, scale=1.0):
         k = max(3, int(round(self.beacon_size * scale)))
@@ -398,7 +405,7 @@ class VideoBeaconTracker:
     def _peaks(self, response, med, sigma, threshold, k):
         """Strongest response peaks above threshold: (snr, peak, loc). One peak
         normally; the top few when identifying the beacon by brightness."""
-        count = self.CANDIDATES if self.identify_by_level else 1
+        count = self.CANDIDATES if self.identify_by_level or self._appearance_on() else 1
         work = response.copy() if count > 1 else response
         peaks = []
         r = int(1.5 * k) + 1
@@ -421,6 +428,8 @@ class VideoBeaconTracker:
         if not detections:
             return None
         if not self.identify_by_level:
+            if self._appearance_on():
+                return self._most_beacon_like(detections)
             return detections[0]
         if self.expected_level:
             detections = [d for d in detections if d.level >= self.DECOY_LEVEL_RATIO * self.expected_level]
@@ -513,13 +522,106 @@ class VideoBeaconTracker:
                 detection.source = "INTEGRATED"
                 verified.append(detection)
             else:
+                # Brightness measured here in this frame, so the level gate in
+                # _best() still applies: the evidence map builds up just as
+                # well on a decoy (e.g. one the camera is parked on).
                 unverified.append(_Detection(x, y, snr, self.beacon_size, source="INTEGRATED",
-                                             level=float(self.expected_level or 0.0)))
+                                             level=self._local_level(gray, x, y)))
         detection = self._best(verified)
         if detection is None:
             unverified = [d for d in unverified if self._plausible(d)]
+            if self.identify_by_level and self.expected_level:
+                unverified = [d for d in unverified if d.level >= self.DECOY_LEVEL_RATIO * self.expected_level]
+            elif self._appearance_on():
+                unverified = [d for d in unverified if self._most_beacon_like([d]) is not None]
             detection = unverified[0] if unverified else None       # strongest evidence first
         return detection
+
+    # -- appearance model --------------------------------------------------
+
+    def _appearance_on(self):
+        return (self.APPEARANCE and not self.identify_by_level and self._template is not None
+                and self._appearance_count >= self.APPEARANCE_FRAMES
+                and self._appearance_sim is not None and self._appearance_sim >= self.APPEARANCE_RELIABLE)
+
+    def _appearance_threshold(self):
+        if self._appearance_sim is None:
+            return self.APPEARANCE_MIN
+        return max(self.APPEARANCE_MIN, self._appearance_sim - self.APPEARANCE_MARGIN)
+
+    def _highpass(self, x, y, half):
+        """Median-filtered, high-passed patch of +/-half px around (x, y); the
+        frame is extended by replication at the border."""
+        pad = int(3 * self._template_sigma) + 1
+        cx, cy = int(round(x)), int(round(y))
+        r = half + pad
+        x0, y0, x1, y1 = cx - r, cy - r, cx + r + 1, cy + r + 1
+        crop = self._gray[max(0, y0):min(self.height, y1), max(0, x0):min(self.width, x1)]
+        if crop.size == 0:
+            return None
+        crop = cv2.copyMakeBorder(np.ascontiguousarray(crop), max(0, -y0), max(0, y1 - self.height),
+                                  max(0, -x0), max(0, x1 - self.width), cv2.BORDER_REPLICATE)
+        g = cv2.medianBlur(crop, 3).astype(np.float32)
+        g -= cv2.GaussianBlur(g, (0, 0), self._template_sigma)
+        return g[pad:-pad, pad:-pad]
+
+    def _similarity(self, x, y):
+        """Normalised correlation of the spot at (x, y) with the beacon template."""
+        half = self._template.shape[0] // 2
+        search = self._highpass(x, y, half + self.APPEARANCE_ALIGN)
+        if search is None:
+            return -1.0
+        return float(cv2.matchTemplate(search, self._template, cv2.TM_CCOEFF_NORMED).max())
+
+    def _most_beacon_like(self, detections):
+        """The candidate that best matches the beacon template, or None when
+        none matches well enough (all decoys)."""
+        threshold = self._appearance_threshold()
+        best = None
+        for d in detections:
+            d.similarity = self._similarity(d.x, d.y)
+            if d.similarity >= threshold and (best is None or d.similarity > best.similarity):
+                best = d
+        return best
+
+    def _learn_appearance(self, detection):
+        """Create / update the beacon template from a locked measurement."""
+        if not self.APPEARANCE or self.identify_by_level or self._gray is None:
+            return
+        if self._template is None:
+            # Wide enough to take in a halo around the core.
+            self._template_sigma = max(2.0, 0.4 * self.beacon_size)
+            self._template = self._highpass(detection.x, detection.y, int(np.clip(2.5 * self.beacon_size, 10, 40)))
+            self._appearance_count = 1
+            return
+        gating = self._appearance_on()
+        similarity = detection.similarity
+        if similarity is None:
+            similarity = self._similarity(detection.x, detection.y)
+        if gating and similarity < self._appearance_threshold():
+            return
+        self._appearance_sim = (similarity if self._appearance_sim is None
+                                else 0.9 * self._appearance_sim + 0.1 * similarity)
+        if not gating or similarity >= self._appearance_threshold() + 0.5 * self.APPEARANCE_MARGIN:
+            # Learning: running mean over the first frames (averages out the
+            # noise), then a slow update that follows appearance changes.
+            patch = self._highpass(detection.x, detection.y, self._template.shape[0] // 2)
+            if patch is not None and patch.shape == self._template.shape:
+                rate = max(self.APPEARANCE_LEARN, 1.0 / (self._appearance_count + 1))
+                self._template = (1 - rate) * self._template + rate * patch
+                self._appearance_count += 1
+
+    def _local_level(self, gray, x, y):
+        """Core brightness at (x, y): 90th percentile of the median-filtered
+        beacon-sized patch, as _centroid() measures it for a detected spot."""
+        half = max(2, int(round(0.5 * self.beacon_size)))
+        cx, cy = int(round(x)), int(round(y))
+        x0, y0 = max(0, cx - half - 1), max(0, cy - half - 1)
+        patch = gray[y0:min(self.height, cy + half + 2), x0:min(self.width, cx + half + 2)]
+        if patch.shape[0] < 3 or patch.shape[1] < 3:
+            return 0.0
+        patch = cv2.medianBlur(np.ascontiguousarray(patch), 3)[1:-1, 1:-1]
+        return float(np.percentile(patch, 90))
 
     def _acquire(self, gray):
         scale, k, response, med, sigma = self._acquisition_response(gray)
@@ -538,7 +640,51 @@ class VideoBeaconTracker:
                 detection = None
             if detection is None:
                 detection = self._acquire_integrated(gray, scale, k)
+        designated = self._designate(gray)
+        if designated is not False:
+            return self._at_designated(gray, detection, designated)
         return detection if detection is not None else self._acquire_yolo(gray)
+
+    def _designate(self, gray):
+        """Where YOLO sees the beacon (full-resolution px), None if it sees
+        none, or False when not applicable.
+
+        Until the beacon's appearance is learned nothing tells it apart from
+        decoys, so the strongest spot would be taken. YOLO is trained to tell
+        the beacon (halo rings) from plain decoys, so it designates which spot
+        to lock. Its answer is reused for YOLO_EVERY frames to bound the cost.
+        """
+        if (self.yolo is None or self._yolo_executor is not None or self.identify_by_level
+                or self._appearance_on()):
+            return False
+        self._yolo_skip = (self._yolo_skip + 1) % self.YOLO_EVERY
+        if self._yolo_skip == 1 or self._designated is None:
+            scale = min(1.0, 640.0 / max(self.width, self.height))
+            small = gray if scale >= 1.0 else cv2.resize(gray, None, fx=scale, fy=scale,
+                                                         interpolation=cv2.INTER_AREA)
+            try:
+                position, _ = self.yolo.detect(cv2.cvtColor(small, cv2.COLOR_GRAY2BGR))
+            except Exception:
+                position = None
+            self._designated = (None if position is None else (position[0] / scale, position[1] / scale), 0)
+        else:
+            self._designated = (self._designated[0], self._designated[1] + 1)
+        return self._designated[0]
+
+    def _at_designated(self, gray, detection, designated):
+        """The candidate at YOLO's beacon position: the acquired detection if it
+        is there, else a local search there. No YOLO beacon: unchanged."""
+        if designated is None:
+            return detection
+        tolerance = 2 * self.beacon_size + 10 + 3 * self._designated[1]
+        if detection is not None and math.hypot(detection.x - designated[0],
+                                                detection.y - designated[1]) <= tolerance:
+            return detection
+        detection = self._detect_region(gray, designated, int(3 * self.beacon_size + 8 + tolerance), self.TRACK_SNR)
+        if detection is None or math.hypot(detection.x - designated[0], detection.y - designated[1]) > tolerance:
+            return None
+        detection.source = "YOLO"
+        return detection
 
     def _acquire_full_resolution(self, gray):
         """Second acquisition pass for small or faint beacons.

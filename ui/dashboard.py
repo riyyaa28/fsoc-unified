@@ -23,21 +23,83 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QDialog,
+    QStyle,
 )
 
-from PyQt5.QtGui import QDesktopServices, QImage, QPixmap
+from PyQt5.QtGui import QDesktopServices, QImage, QPainter, QPixmap
 from PyQt5.QtCore import QTimer, Qt, QUrl
 
 import os
+from collections import deque
 from datetime import datetime
 
 from ui.video_report import write_video_benchmark_report
+from vision.frame_reader import FrameReader
 from vision.video_tracker import (
     BenchmarkMetrics, VideoBeaconTracker, find_ground_truth, load_ground_truth,
 )
-from sim.scenario import ATMOSPHERES, PLATFORM_MOTIONS, ScenarioConfig, ScenarioRunner, apply_disturbances
+from sim.scenario import (
+    ATMOSPHERES, PLATFORM_MOTIONS, ScenarioConfig, ScenarioRunner, _atmosphere, apparent_level, apply_disturbances,
+)
 from ui.scenario_dialog import ScenarioDialog
 from ui.scenario_report import export_scenario_outputs
+
+
+class ImageView(QLabel):
+    """Label for the live views. QLabel.setPixmap() re-runs the whole window
+    layout on every call (several ms per frame on this dashboard); here a new
+    frame only repaints the label itself. The stylesheet frame is unchanged."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self._frame = None
+
+    def setPixmap(self, pixmap):
+        self._frame = pixmap
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._frame is None or self._frame.isNull():
+            return
+        r = self.contentsRect()
+        painter = QPainter(self)
+        painter.drawPixmap(r.x() + (r.width() - self._frame.width()) // 2,
+                           r.y() + (r.height() - self._frame.height()) // 2, self._frame)
+        painter.end()
+
+
+class Isolated(QWidget):
+    """Holder for a label whose text changes every frame. QLabel.setText()
+    re-runs its parent's layout; with this layout-less holder as the parent,
+    the dashboard's (large) layout is no longer recalculated each frame."""
+
+    def __init__(self, child):
+        super().__init__()
+        self.child = child
+        child.setParent(self)
+        self.setSizePolicy(child.sizePolicy())
+        self.setMinimumSize(child.minimumSize())
+        self.setMaximumSize(child.maximumSize())
+
+    def sizeHint(self):
+        return self.child.sizeHint()
+
+    def minimumSizeHint(self):
+        return self.child.minimumSizeHint()
+
+    def resizeEvent(self, event):
+        self.child.setGeometry(self.rect())
+
+
+class SeekSlider(QSlider):
+    """Horizontal slider that jumps straight to where it is clicked, then drags."""
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.setValue(QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), int(event.x()),
+                                                         max(1, self.width())))
+        super().mousePressEvent(event)
 
 
 class Dashboard(QWidget):
@@ -45,13 +107,8 @@ class Dashboard(QWidget):
     def __init__(self):
         super().__init__()
 
-        # ==========================================================
-        # WINDOW
-        # ==========================================================
-
         self.setWindowTitle("FSOC Coarse Alignment Control Center")
 
-        # Fit the complete dashboard inside the available screen.
         screen = QApplication.primaryScreen()
 
         if screen is not None:
@@ -68,10 +125,6 @@ class Dashboard(QWidget):
             self.setMinimumSize(1000, 650)
 
             self.resize(1200, 800)
-
-        # ==========================================================
-        # PIPELINE SETUP
-        # ==========================================================
 
         # Benchmark-1 scenario engine: virtual PTZ camera over a large screen
         # (sim/scenario.py). A fresh ScenarioRunner is built on RESET / START.
@@ -95,10 +148,6 @@ class Dashboard(QWidget):
         self.reacquisition_time = None
         self.screen_center = (320, 240)
 
-        # ==========================================================
-        # SIMULATION CONTROLS
-        # ==========================================================
-
         self.running = False
         self.media_capture = None
         self.media_path = None
@@ -106,10 +155,6 @@ class Dashboard(QWidget):
         # HIDE BEACON: the target keeps moving but is not drawn.
         self.beacon_hidden = False
         self.search_state = "READY"
-
-        # ==========================================================
-        # TELEMETRY VARIABLES
-        # ==========================================================
 
         self.current_dx = 0.0
         self.current_dy = 0.0
@@ -126,10 +171,6 @@ class Dashboard(QWidget):
         self.activity_previous_state = None
         self._reset_report_session()
 
-        # ==========================================================
-        # STABLE DISPLAY TELEMETRY
-        # ==========================================================
-
         self.display_confidence = 0.0
         self.CONFIDENCE_ALPHA = 0.12
 
@@ -138,15 +179,7 @@ class Dashboard(QWidget):
         self.source_hold_count = 0
         self.SOURCE_HOLD_FRAMES = 5
 
-        # ==========================================================
-        # UI
-        # ==========================================================
-
         self._build_ui()
-
-        # ==========================================================
-        # TIMER
-        # ==========================================================
 
         # Frame loop: a single-shot precise timer re-armed against an absolute
         # deadline every 1 / rate s (see _tick), so timer lateness is made up on
@@ -157,6 +190,9 @@ class Dashboard(QWidget):
         self.timer.timeout.connect(self._tick)
         self.loop_rate_hz = self.scenario_config.update_rate_hz
         self._next_deadline = None
+        self._behind = False                # this frame started late (see _should_draw)
+        self._skipped_draws = 0
+        self._draw_times = deque(maxlen=31)
 
         self._sync_controls_from_config()
         self._new_runner()
@@ -172,17 +208,9 @@ class Dashboard(QWidget):
 
     def _build_ui(self):
 
-        # ----------------------------------------------------------
-        # TITLE
-        # ----------------------------------------------------------
-
         title = QLabel("FSOC COARSE ALIGNMENT CONTROL CENTER")
 
         title.setObjectName("mainTitle")
-
-        # ----------------------------------------------------------
-        # SYSTEM STATUS
-        # ----------------------------------------------------------
 
         self.system_status = QLabel("● SYSTEM INITIALIZING")
 
@@ -191,11 +219,7 @@ class Dashboard(QWidget):
         # from triggering a relayout / full-window repaint.
         self.system_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
 
-        # ----------------------------------------------------------
-        # FULL SCENE VIEW
-        # ----------------------------------------------------------
-
-        self.full_scene_label = QLabel()
+        self.full_scene_label = ImageView()
 
         # Size comes from the layout stretch only, not from the pixmap it shows,
         # so replacing the pixmap every frame never re-runs the layout.
@@ -209,15 +233,10 @@ class Dashboard(QWidget):
 
         self.full_scene_label.setObjectName("videoPanel")
 
-        # ----------------------------------------------------------
-        # PAT TELEMETRY
-        # ----------------------------------------------------------
-
         self.pat_panel = QLabel("Initializing telemetry...")
 
         self.pat_panel.setMinimumWidth(0)
 
-        # Reserve enough room for every telemetry row at the larger font.
         self.pat_panel.setMinimumHeight(450)
         self.pat_panel.setMaximumHeight(480)
 
@@ -227,29 +246,19 @@ class Dashboard(QWidget):
 
         self.pat_panel.setObjectName("telemetryPanel")
 
-        # ----------------------------------------------------------
-        # BORESIGHT VIEW
-        # ----------------------------------------------------------
-
         boresight_title = QLabel("FSOC CAMERA / BORESIGHT")
 
         boresight_title.setObjectName("boresightTitle")
 
-        self.boresight_label = QLabel()
+        self.boresight_label = ImageView()
 
         self.boresight_label.setAlignment(Qt.AlignCenter)
 
         self.boresight_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
 
-        # Give the telemetry panel the vertical space it needs; the camera
-        # preview can shrink while remaining large enough to inspect.
         self.boresight_label.setMinimumSize(360, 170)
 
         self.boresight_label.setObjectName("boresightPanel")
-
-        # ----------------------------------------------------------
-        # RIGHT SIDE
-        # ----------------------------------------------------------
 
         right_column = QVBoxLayout()
 
@@ -257,18 +266,40 @@ class Dashboard(QWidget):
 
         right_column.setSpacing(5)
 
-        # Telemetry gets only its required height.
-        right_column.addWidget(self.pat_panel, 0)
+        right_column.addWidget(Isolated(self.pat_panel), 0)
 
-        # Boresight header.
         right_column.addWidget(boresight_title, 0)
 
-        # Boresight receives ALL remaining vertical space.
         right_column.addWidget(self.boresight_label, 1)
+
+        # Video progress bar under the main view (video mode only): shows the
+        # position in the clip and can be dragged / clicked to seek.
+        self.video_slider = SeekSlider(Qt.Horizontal)
+        self.video_slider.setToolTip("Video position: drag or click to jump. Jumping restarts the "
+                                     "track and the measurement from the new position.")
+        self.video_slider.valueChanged.connect(self._on_video_slider_changed)
+        self.video_slider.sliderMoved.connect(self._show_video_time)
+        self.video_slider.sliderReleased.connect(lambda: self._seek_video(self.video_slider.value()))
+        self.video_time_label = QLabel("00:00 / 00:00")
+        self.video_time_label.setMinimumWidth(230)
+        self.video_time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.video_bar = QWidget()
+        bar_row = QHBoxLayout(self.video_bar)
+        bar_row.setContentsMargins(4, 0, 4, 0)
+        bar_row.addWidget(self.video_slider, 1)
+        bar_row.addWidget(Isolated(self.video_time_label), 0)
+        self.video_bar.hide()
+        self._updating_video_slider = False
+
+        left_column = QVBoxLayout()
+        left_column.setContentsMargins(0, 0, 0, 0)
+        left_column.setSpacing(3)
+        left_column.addWidget(self.full_scene_label, 1)
+        left_column.addWidget(self.video_bar, 0)
 
         video_row = QHBoxLayout()
         video_row.setSpacing(8)
-        video_row.addWidget(self.full_scene_label, 7)
+        video_row.addLayout(left_column, 7)
         video_row.addLayout(right_column, 3)
 
         controls_title = QLabel("SIMULATION CONTROL")
@@ -285,7 +316,7 @@ class Dashboard(QWidget):
         main_layout.addWidget(title)
 
         main_layout.addLayout(video_row, 6)
-        main_layout.addWidget(self.system_status)
+        main_layout.addWidget(Isolated(self.system_status))
         main_layout.addWidget(controls_title)
         main_layout.addLayout(controls_panel)
         main_layout.addWidget(disturbance_title)
@@ -422,10 +453,6 @@ class Dashboard(QWidget):
 
         row = QHBoxLayout()
 
-        # ----------------------------------------------------------
-        # SIMULATION BUTTONS
-        # ----------------------------------------------------------
-
         self.start_button = QPushButton("START")
 
         self.pause_button = QPushButton("PAUSE")
@@ -494,10 +521,6 @@ class Dashboard(QWidget):
 
         row.addSpacing(12)
 
-        # ----------------------------------------------------------
-        # PATTERN
-        # ----------------------------------------------------------
-
         row.addWidget(QLabel("Pattern:"))
 
         self.pattern_combo = QComboBox()
@@ -511,10 +534,6 @@ class Dashboard(QWidget):
         self.pattern_combo.currentTextChanged.connect(self._on_pattern_changed)
 
         row.addWidget(self.pattern_combo)
-
-        # ----------------------------------------------------------
-        # DECOYS
-        # ----------------------------------------------------------
 
         row.addWidget(QLabel("Decoys:"))
 
@@ -557,7 +576,6 @@ class Dashboard(QWidget):
                 self._new_runner()
             self.loop_rate_hz = self.runner.cfg.update_rate_hz
             self.running = True
-            self._last_tick = None
             self._start_loop()
             self._record_activity("SIMULATION", "Scenario running")
 
@@ -614,6 +632,9 @@ class Dashboard(QWidget):
             f"{info['fps'] or 0:.1f} fps{length})",
         )
         self._start_video_benchmark(path, capture)
+        self.media_capture = FrameReader(capture)   # decode ahead on a worker thread
+        self.video_pos = 0                    # index of the next frame to be read
+        self._setup_video_bar()
         truth_note = "GROUND TRUTH LOADED" if self.video_metrics.ground_truth is not None else "NO GROUND TRUTH"
         self.system_status.setText(f"● VIDEO LOADED   |   PTZ BYPASSED   |   {truth_note}")
         if autostart:
@@ -686,14 +707,25 @@ class Dashboard(QWidget):
         if path:
             self._apply_ground_truth(path)
 
-    def _process_uploaded_frame(self, frame, frame_started=None):
-        """Run one video frame through the coarse-pointing pipeline (PTZ bypassed)."""
+    def _process_uploaded_frame(self, frame, frame_started=None, index=None, gray=None, draw=True):
+        """Run one video frame through the coarse-pointing pipeline (PTZ bypassed).
+
+        index: the frame's position in the video (matches the ground truth).
+        gray: the frame already converted to grey (by the decoder thread).
+        draw: False to measure the frame without updating the screen."""
         frame_started = frame_started or time.perf_counter()
-        index = self.video_metrics_frame_index()
-        result = self.video_tracker.process(frame, index)
+        index = len(self.video_metrics.results) if index is None else index
+        result = self.video_tracker.process(frame if gray is None else gray, index)
         metrics = self.video_metrics
         truth = metrics.truth(index)
         error = metrics.centroid_error(result)
+        if not draw:
+            self.frame_count += 1
+            if self.frame_count % 30 == 0:
+                self._sample_activity()
+            frame_ms = (time.perf_counter() - frame_started) * 1000.0
+            metrics.add(result, frame_ms)
+            return
 
         self._draw_video_views(frame, result, truth)
 
@@ -705,6 +737,8 @@ class Dashboard(QWidget):
             status = "● BEACON COASTING   |   FOLLOWING KALMAN PREDICTION"
         else:
             status = "● SEARCHING FOR BEACON   |   WHOLE-FRAME ACQUISITION"
+        if self.running and self._fps_ema:
+            status += f"   |   {self._fps_ema:4.1f} FPS   (display {self._display_fps():.0f})"
         self.system_status.setText(status)
 
         # Detection confidence shown on the panel: SNR mapped to 0..1
@@ -745,16 +779,89 @@ class Dashboard(QWidget):
         metrics.add(result, frame_ms)
         self.current_fps = min(self.video_metrics.fps, 1000.0 / max(1.0, frame_ms))
 
-    def video_metrics_frame_index(self):
-        return len(self.video_metrics.results)
+    # -- video progress bar ---------------------------------------------------
+
+    def _setup_video_bar(self):
+        total = self.video_info.get("frames")
+        if not total:
+            self.video_bar.hide()             # unknown length (e.g. some streams): no bar
+            return
+        self._updating_video_slider = True
+        self.video_slider.setRange(0, total - 1)
+        self.video_slider.setPageStep(max(1, total // 20))
+        self.video_slider.setValue(0)
+        self._updating_video_slider = False
+        self._show_video_time(0)
+        self.video_bar.show()
+
+    def _update_video_bar(self):
+        if not self.video_bar.isVisible() or self.video_slider.isSliderDown():
+            return
+        value = min(self.video_pos, self.video_slider.maximum())
+        self._updating_video_slider = True
+        self.video_slider.setValue(value)
+        self._updating_video_slider = False
+        self._show_video_time(value)
+
+    def _show_video_time(self, frame):
+        fps = self.video_info.get("fps") or 30.0
+        total = self.video_info.get("frames") or 0
+
+        def mmss(seconds):
+            return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+
+        self.video_time_label.setText(f"{mmss(frame / fps)} / {mmss(total / fps)}   frame {frame} / {total}")
+
+    def _on_video_slider_changed(self, value):
+        # Clicks on the bar and keyboard steps seek at once; a drag seeks on release.
+        if not self._updating_video_slider and not self.video_slider.isSliderDown():
+            self._seek_video(value)
+
+    def _seek_video(self, frame):
+        """Jump to a frame. Frames are no longer consecutive after a jump, so the
+        track and the measurement restart from there (logged in the activity log)."""
+        if not self.media_path:
+            return
+        total = self.video_info.get("frames") or 0
+        frame = int(max(0, min(frame, max(total - 1, 0))))
+        if self.media_capture is None:        # clip had finished: reopen it
+            capture = cv2.VideoCapture(self.media_path)
+            if not capture.isOpened():
+                capture.release()
+                return
+            self.media_capture = FrameReader(capture)
+        self.media_capture.set(cv2.CAP_PROP_POS_FRAMES, frame)
+        self.video_pos = frame
+        old = self.video_metrics
+        self.video_tracker.reset()
+        self.video_metrics = BenchmarkMetrics(old.fps, old.width, old.height, old.fov_deg, old.ground_truth)
+        self.video_complete = False
+        fps = self.video_info.get("fps") or 30.0
+        self._record_activity("VIDEO", f"Jumped to frame {frame} ({frame / fps:.2f} s); track and "
+                                       f"measurement restarted from here")
+        self._show_video_time(frame)
+        if not self.running:
+            # Paused: show the frame at the new position straight away.
+            ok, image = self.media_capture.read()
+            if ok:
+                self._process_uploaded_frame(image, None, self.video_pos, gray=self.media_capture.gray)
+                self.video_pos += 1
+                self._update_video_bar()
 
     def _draw_video_views(self, frame, result, truth):
         """Scene view: whole frame with markers. Bore-sight view: zoom on the beacon."""
         height, width = frame.shape[:2]
         label = self.full_scene_label
         scale = min(max(label.width(), 320) / width, max(label.height(), 240) / height)
-        display = cv2.resize(frame, (max(1, int(width * scale)), max(1, int(height * scale))),
-                             interpolation=cv2.INTER_AREA)
+        size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        # Large reductions average whole blocks first (OpenCV's fast integer
+        # path), so a beacon of a few pixels stays visible; the rest is a
+        # linear resize to the exact label size. Qt then draws it unscaled.
+        factor = int(1 / scale) if scale < 1 else 1
+        reduced = frame
+        if factor > 1:
+            reduced = cv2.resize(frame, (width // factor, height // factor), interpolation=cv2.INTER_AREA)
+        display = cv2.resize(reduced, size, interpolation=cv2.INTER_LINEAR)
         if display.ndim == 2:
             display = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
         dh, dw = display.shape[:2]
@@ -773,26 +880,31 @@ class Dashboard(QWidget):
                     (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
         if truth is not None:
             cv2.putText(display, "+ ground truth", (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1, cv2.LINE_AA)
-        label.setPixmap(self._cv_to_qpixmap(display, label))
+        label.setPixmap(self._pixmap(display))
 
-        # Bore-sight view: 4x zoom around the reported beacon position (or the centre).
+        # Bore-sight view: zoom around the reported beacon position (or the
+        # centre), enlarged to fit the panel.
         cx, cy = (result.x, result.y) if result.x is not None else (width / 2, height / 2)
         half_w, half_h = 60, 45
         x0 = int(np.clip(round(cx) - half_w, 0, max(0, width - 2 * half_w)))
         y0 = int(np.clip(round(cy) - half_h, 0, max(0, height - 2 * half_h)))
         crop = frame[y0:y0 + 2 * half_h, x0:x0 + 2 * half_w]
         if crop.size:
-            zoom = cv2.resize(crop, (crop.shape[1] * 4, crop.shape[0] * 4), interpolation=cv2.INTER_NEAREST)
+            blabel = self.boresight_label
+            z = min(max(blabel.width(), 200) / crop.shape[1], max(blabel.height(), 150) / crop.shape[0])
+            zoom = cv2.resize(crop, (max(1, int(crop.shape[1] * z)), max(1, int(crop.shape[0] * z))),
+                              interpolation=cv2.INTER_NEAREST)
             if zoom.ndim == 2:
                 zoom = cv2.cvtColor(zoom, cv2.COLOR_GRAY2BGR)
+            mark = z / 4.0                      # marker sizes were chosen for a 4x zoom
             if result.x is not None:
-                zx, zy = int(round((result.x - x0) * 4)), int(round((result.y - y0) * 4))
+                zx, zy = int(round((result.x - x0) * z)), int(round((result.y - y0) * z))
                 color = (0, 255, 0) if result.measured else (0, 170, 255)
-                cv2.drawMarker(zoom, (zx, zy), color, cv2.MARKER_CROSS, 40, 2)
+                cv2.drawMarker(zoom, (zx, zy), color, cv2.MARKER_CROSS, max(12, int(40 * mark)), 2)
             if truth is not None:
-                gx, gy = int(round((truth[0] - x0) * 4)), int(round((truth[1] - y0) * 4))
-                cv2.drawMarker(zoom, (gx, gy), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 24, 2)
-            self.boresight_label.setPixmap(self._cv_to_qpixmap(zoom, self.boresight_label))
+                gx, gy = int(round((truth[0] - x0) * z)), int(round((truth[1] - y0) * z))
+                cv2.drawMarker(zoom, (gx, gy), (255, 0, 255), cv2.MARKER_TILTED_CROSS, max(8, int(24 * mark)), 2)
+            blabel.setPixmap(self._pixmap(zoom))
 
     def _video_output_base(self):
         folder = os.path.join(os.path.expanduser("~"), "Downloads", "fsoc-benchmark")
@@ -862,8 +974,10 @@ class Dashboard(QWidget):
         self.runner = ScenarioRunner(self.scenario_config, yolo=self.detector, yolo_async=True)
         self.frame_count = 0
         self._overview_key = None
+        self._overview_rain = None
         self._fps_ema = 0.0
-        self._last_tick = None
+        self._loop_times = deque(maxlen=31)
+        self._draw_count = 0
         self._scenario_exported = False
         self._reset_report_session()
         self._record_activity(
@@ -934,6 +1048,7 @@ class Dashboard(QWidget):
             self.media_capture.release()
             self.media_capture = None
         self.media_path = None
+        self.video_bar.hide()
         self.beacon_hidden = False
         self.hide_button.setText("HIDE BEACON")
         self.search_state = "READY"
@@ -1057,35 +1172,39 @@ class Dashboard(QWidget):
             self.runner.set_decoys(int(value))
         self._record_activity("PARAMETER", f"Decoy target count set to {value}")
 
-    def _scenario_step(self, frame_started):
+    def _scenario_step(self, frame_started, draw=True):
         runner = self.runner
-        now = time.perf_counter()
-        if self._last_tick is not None:
-            interval = now - self._last_tick
-            rate = 1.0 / interval if interval > 0 else 0.0
-            self._fps_ema = rate if not self._fps_ema else 0.9 * self._fps_ema + 0.1 * rate
-        self._last_tick = now
         result = runner.step(frame_started)
         self.frame_count += 1
         self.current_fps = self._fps_ema
         self.current_processing_ms = result.processing_ms
         self.search_state = {"LOCKED": "LOCKED", "TENTATIVE": "ACQUIRING",
                              "COAST": "COASTING"}.get(result.state, "SEARCHING")
+        if self.search_state == "SEARCHING" and runner.memory.active:
+            self.search_state = "PREDICTING"      # beacon lost: pointing follows the Kalman memory
         error = runner.metrics.centroid_error(result)
         self.current_error = error[2] if error else float("nan")
-        self._draw_scenario_views()
-        if self.frame_count % 3 == 0:
-            self._update_scenario_panel(result)
         if self.frame_count % 30 == 0:
             self._sample_activity()
+        if not draw:
+            if runner.finished():
+                self._finish_scenario()
+            return
+        self._draw_count += 1
+        self._draw_scenario_views()
+        if self._draw_count % 3 == 0:
+            self._update_scenario_panel(result)
         if self.search_state == "LOCKED":
             style, detail = "ok", f"LOCKED   |   CENTROID ERR {self._fmt(self.current_error, 2, ' px')}"
         elif self.search_state in ("ACQUIRING", "COASTING"):
             style, detail = "warn", self.search_state
+        elif self.search_state == "PREDICTING":
+            style, detail = "warn", f"BEACON LOST   |   FOLLOWING KALMAN PREDICTION ({runner.memory.model})"
         else:
             style, detail = "warn", "SEARCHING   |   SPIRAL SCAN"
         self._set_status(
-            f"● t = {runner.time_s:6.2f} s   |   PAT: {detail}   |   {self._fps_ema:4.1f} FPS", style
+            f"● t = {runner.time_s:6.2f} s   |   PAT: {detail}   |   {self._fps_ema:4.1f} FPS"
+            f"   (display {self._display_fps():.0f})", style
         )
         if runner.finished():
             self._finish_scenario()
@@ -1154,13 +1273,13 @@ class Dashboard(QWidget):
 
     @staticmethod
     def _pixmap(image):
+        """Grey or BGR image -> QPixmap (Qt reads BGR directly; no colour conversion)."""
+        image = np.ascontiguousarray(image)
+        h, w = image.shape[:2]
         if image.ndim == 2:
-            h, w = image.shape
             qimg = QImage(image.data, w, h, w, QImage.Format_Grayscale8).copy()
         else:
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            h, w = rgb.shape[:2]
-            qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+            qimg = QImage(image.data, w, h, 3 * w, QImage.Format_BGR888).copy()
         return QPixmap.fromImage(qimg)
 
     def _draw_scenario_views(self, preview=False):
@@ -1168,14 +1287,30 @@ class Dashboard(QWidget):
         runner = self.runner
         if runner is None:
             return
-        if preview or self.frame_count % 2 == 0:
+        if preview or self._draw_count % 2 == 0:
             # The screen overview is a thumbnail; every other frame is plenty.
             self._draw_screen_overview(runner)
         self._draw_camera_view(runner, preview)
 
     def _state_color(self):
         return {"LOCKED": (80, 255, 120), "ACQUIRING": (0, 210, 255),
-                "COASTING": (0, 170, 255)}.get(self.search_state, (60, 60, 255))
+                "COASTING": (0, 170, 255), "PREDICTING": (0, 170, 255)}.get(self.search_state, (60, 60, 255))
+
+    def _overview_rain_layer(self, shape, strength):
+        """Animated rain streaks for the screen view (a few pre-drawn layers, cycled)."""
+        if self._overview_rain is None or self._overview_rain[0].shape != shape:
+            rng = np.random.default_rng(7)
+            h, w = shape[:2]
+            layers = []
+            for _ in range(4):
+                layer = np.zeros(shape, np.uint8)
+                for _ in range(int(w * h / 700)):
+                    x, y = int(rng.integers(0, w)), int(rng.integers(0, h))
+                    cv2.line(layer, (x, y), (x + 1, y + int(rng.integers(5, 12))), (255, 255, 255), 1)
+                layers.append(layer)
+            self._overview_rain = layers
+        layer = self._overview_rain[self.frame_count % len(self._overview_rain)]
+        return cv2.convertScaleAbs(layer, alpha=0.25 * strength)
 
     def _draw_screen_overview(self, runner):
         cfg = runner.cfg
@@ -1186,35 +1321,55 @@ class Dashboard(QWidget):
         label = self.full_scene_label
         lw, lh = max(label.width(), 320), max(label.height(), 240)
         scale = min(lw / cfg.screen_width, lh / cfg.screen_height)
-        key = (id(runner), lw, lh)
+        # The atmosphere belongs to the scene, so the screen view shows it too
+        # (sensor noise and jitter belong to the camera and stay in its view).
+        atmosphere = (cfg.atmosphere, round(cfg.atmosphere_strength, 2)) if cfg.atmosphere != "clear" else None
+        key = (id(runner), lw, lh, atmosphere)
         if self._overview_key != key:
             pad = scene.pad
             size = (max(1, int(cfg.screen_width * scale)), max(1, int(cfg.screen_height * scale)))
             if scene.background_bgr is not None:
                 screen = scene.background_bgr[pad:pad + cfg.screen_height, pad:pad + cfg.screen_width]
-                self._overview_base = cv2.resize(screen, size, interpolation=cv2.INTER_AREA)
+                base = cv2.resize(screen, size, interpolation=cv2.INTER_AREA)
             else:
                 screen = scene.background[pad:pad + cfg.screen_height, pad:pad + cfg.screen_width]
                 small = cv2.resize(screen, size, interpolation=cv2.INTER_AREA)
                 small = cv2.convertScaleAbs(small, alpha=1.5, beta=12)  # brighten the dark sky for viewing
-                self._overview_base = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+                base = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+            if atmosphere:
+                base = np.clip(_atmosphere(base.astype(np.float32), cfg), 0, 255).astype(np.uint8)
+            self._overview_base = base
+            self._overview_rain = None
             self._overview_key = key
         view = self._overview_base.copy()
-        # Decoy beacons: white spots at their own brightness.
+        if cfg.atmosphere == "rain" and cfg.atmosphere_strength > 0:
+            view = cv2.add(view, self._overview_rain_layer(view.shape, cfg.atmosphere_strength))
+
+        def shade(level):
+            """A white spot's brightness after the atmosphere, as a BGR colour."""
+            v = int(np.clip(apparent_level(cfg, level), 0, 255))
+            return (v, v, v)
+
         for d in scene.decoys:
-            level = int(d["level"])
             cv2.circle(view, (int(d["pos"][0] * scale), int(d["pos"][1] * scale)),
-                       max(2, int(round(d["size"] * scale))), (level, level, level), -1, cv2.LINE_AA)
+                       max(2, int(round(d["size"] * scale))), shade(d["level"]), -1, cv2.LINE_AA)
         # The designated beacon: bright core with its halo rings (original look).
         bx, by = int(scene.motion.pos[0] * scale), int(scene.motion.pos[1] * scale)
         core = max(2, int(round(cfg.target_size_px * scale)))
         if runner.beacon_visible():
             if cfg.target_shape == "ringed":
-                cv2.circle(view, (bx, by), int(core * 3.5), (80, 80, 80), 1, cv2.LINE_AA)
-                cv2.circle(view, (bx, by), core * 2, (200, 200, 200), 1, cv2.LINE_AA)
-            cv2.circle(view, (bx, by), core, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(view, (bx, by), int(core * 3.5), shade(cfg.target_level * 80 / 255), 1, cv2.LINE_AA)
+                cv2.circle(view, (bx, by), core * 2, shade(cfg.target_level * 200 / 255), 1, cv2.LINE_AA)
+            cv2.circle(view, (bx, by), core, shade(cfg.target_level), -1, cv2.LINE_AA)
         else:
             cv2.circle(view, (bx, by), core * 2, (110, 110, 110), 1, cv2.LINE_AA)   # hidden: outline only
+        memory = runner.memory
+        if memory.active:
+            # Kalman memory: predicted beacon position and the re-acquisition gate.
+            fx, fy = int(memory.fix[0] * scale), int(memory.fix[1] * scale)
+            cv2.circle(view, (fx, fy), int(memory.radius() * scale), (0, 170, 255), 1, cv2.LINE_AA)
+            px, py = int(memory.pos[0] * scale), int(memory.pos[1] * scale)
+            cv2.drawMarker(view, (px, py), (0, 170, 255), cv2.MARKER_DIAMOND, 12, 2)
         cam = runner.camera
         x0, y0 = int((cam[0] - cfg.camera_width / 2) * scale), int((cam[1] - cfg.camera_height / 2) * scale)
         x1, y1 = int((cam[0] + cfg.camera_width / 2) * scale), int((cam[1] + cfg.camera_height / 2) * scale)
@@ -1384,22 +1539,6 @@ class Dashboard(QWidget):
             self, "Report downloaded",
             f"Report saved to your Downloads folder and opened:\n\n{os.path.basename(path)}",
         )
-
-    def _cv_to_qpixmap(self, bgr_frame, target_label=None):
-        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
-        pix = QPixmap.fromImage(qimg)
-        if target_label is not None:
-            size = target_label.size()
-            if size.width() > 0 and size.height() > 0:
-                pix = pix.scaled(
-                    size.width(),
-                    size.height(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
-                )
-        return pix
 
     def _update_pat_panel(
         self, tracked_pos, display_confidence, display_source, error, dist_m,
@@ -1600,10 +1739,19 @@ class Dashboard(QWidget):
         """Run one frame, then re-arm for the next 1 / rate deadline."""
         if not self.running:
             return
+        period = 1.0 / self.loop_rate_hz
+        now = time.perf_counter()
+        self._behind = now - (self._next_deadline or 0.0) > 0.25 * period
+        # Loop rate over the last ~30 frames (frames / elapsed time).
+        if self._loop_times and now - self._loop_times[-1] > 0.5:
+            self._loop_times.clear()            # resumed after a pause
+        self._loop_times.append(now)
+        times = self._loop_times
+        if len(times) >= 2 and times[-1] > times[0]:
+            self._fps_ema = (len(times) - 1) / (times[-1] - times[0])
         self.update_frame()
         if not self.running:
             return
-        period = 1.0 / self.loop_rate_hz
         now = time.perf_counter()
         self._next_deadline = (self._next_deadline or now) + period
         if self._next_deadline < now - period:
@@ -1611,6 +1759,28 @@ class Dashboard(QWidget):
             # rather than bursting to catch up.
             self._next_deadline = now
         self.timer.start(max(0, int((self._next_deadline - now) * 1000)))
+
+    def _should_draw(self):
+        """Whether to update the screen this frame.
+
+        The tracker processes every frame. When the loop runs late (a slow PC,
+        heavy disturbances, a 2000 x 2000 video) the screen update - the costliest
+        part of a frame after tracking - is skipped on some frames instead, so
+        the camera loop and video playback keep real time. At least every
+        third frame is drawn. The display rate is shown next to the loop rate.
+        """
+        if self._behind and self._skipped_draws < 2:
+            self._skipped_draws += 1
+            return False
+        self._skipped_draws = 0
+        self._draw_times.append(time.perf_counter())
+        return True
+
+    def _display_fps(self):
+        times = self._draw_times
+        if len(times) < 2 or times[-1] - times[0] <= 0:
+            return 0.0
+        return (len(times) - 1) / (times[-1] - times[0])
 
     def update_frame(self):
 
@@ -1628,10 +1798,15 @@ class Dashboard(QWidget):
                     self.media_capture = None
                 self._finish_video()
                 return
-            self._process_uploaded_frame(frame, frame_started)
+            draw = self._should_draw()
+            self._process_uploaded_frame(frame, frame_started, self.video_pos,
+                                         gray=self.media_capture.gray, draw=draw)
+            self.video_pos += 1
+            if draw:
+                self._update_video_bar()
             return
 
-        self._scenario_step(frame_started)
+        self._scenario_step(frame_started, self._should_draw())
 
     def closeEvent(self, event):
         if self.media_capture is not None:

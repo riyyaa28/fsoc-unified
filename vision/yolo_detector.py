@@ -1,8 +1,22 @@
+import os
+import sys
+
+import torch
 from ultralytics import YOLO
+
+# Bundled files live beside main.py (source) or in PyInstaller's _MEIPASS.
+APP_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# YOLO runs beside the real-time tracking loop (on a worker thread in the
+# GUI); two threads keep it from taking every CPU core away from that loop.
+torch.set_num_threads(2)
 
 
 class YoloBeaconDetector:
     def __init__(self, weights_path="beacon_yolo.pt", conf_threshold=0.25):
+        # A relative path means the bundled model, wherever the app is started from.
+        if not os.path.isabs(weights_path):
+            weights_path = os.path.join(APP_DIR, weights_path)
         self.model = YOLO(weights_path)
         self.conf_threshold = conf_threshold
 
@@ -21,3 +35,4 @@ class YoloBeaconDetector:
         if best_box is None:
             return None, 0.0
         return best_box, best_conf
+

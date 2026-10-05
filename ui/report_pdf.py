@@ -45,9 +45,7 @@ class TechnicalReport:
         self._new_page()
         self._cover()
 
-    # ------------------------------------------------------------------
-    # primitives (all coordinates in points, origin top-left)
-    # ------------------------------------------------------------------
+    # -- primitives (all coordinates in points, origin top-left) -----------
 
     @staticmethod
     def _font(size, bold=False, mono=False):
@@ -111,9 +109,7 @@ class TechnicalReport:
             lines.append(current)
         return lines or [""]
 
-    # ------------------------------------------------------------------
-    # layout
-    # ------------------------------------------------------------------
+    # -- layout ------------------------------------------------------------
 
     def _new_page(self):
         self.ops = []
@@ -258,9 +254,7 @@ class TechnicalReport:
             self.y += chart_h + 12
         self.y += 8
 
-    # ------------------------------------------------------------------
-    # output
-    # ------------------------------------------------------------------
+    # -- output ------------------------------------------------------------
 
     def finish(self):
         count = len(self.pages)

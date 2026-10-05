@@ -3,7 +3,20 @@ import sys
 import re
 import json
 import threading
-import torch
+# PyInstaller collects another copy of these DLLs in Qt's bin folder. Load
+# the application-root copies first so the loader cannot pick Qt's copy when
+# resolving Torch's native dependencies.
+_vc_runtime_handles = []
+if getattr(sys, "frozen", False):
+    import ctypes
+
+    _bundle_root = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    for _runtime_name in ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"):
+        _runtime_path = os.path.join(_bundle_root, _runtime_name)
+        if os.path.isfile(_runtime_path):
+            _vc_runtime_handles.append(ctypes.WinDLL(_runtime_path))
+
+import torch  # noqa: F401  (load torch DLLs before Qt; the reverse order fails on Windows)
 from functools import partial
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import unquote, urlsplit
@@ -13,7 +26,7 @@ from PyQt5.QtCore import QUrl, QTimer
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget
 from PyQt5.QtWebEngineWidgets import (
-    QWebEngineDownloadItem, QWebEngineSettings, QWebEngineView
+    QWebEngineDownloadItem, QWebEnginePage, QWebEngineSettings, QWebEngineView
 )
 
 # Import must happen before we build the tabs, same ordering FSOC_FINAL relied on.
@@ -30,9 +43,6 @@ class WebHandler(SimpleHTTPRequestHandler):
     _qt_compatible_three_core = None
 
     def do_GET(self):
-        # QWebEngine can otherwise keep an older local module page alive while
-        # iterating on the app, which makes the displayed UI disagree with the
-        # files shipped in the current build.
         # QtWebEngine bundled with PyQt5 is based on an older Chromium that
         # cannot parse ES2022 class static blocks. Three.js uses these blocks
         # only to set type flags on prototypes, so express those initializers
@@ -161,11 +171,11 @@ class MainWindow(QMainWindow):
         """)
         self.setCentralWidget(self.tabs)
 
-        # --- Tab 1: 2D BORE-SIGHT (FSOC_FINAL dashboard, unmodified) ---
+        # --- Tab 1: 2D BORE-SIGHT (scenario engine + video benchmark) ---
         self.dashboard = Dashboard()
         self.tabs.addTab(self.dashboard, "2D BORE-SIGHT")
 
-        # --- Tab 2: 3D AIRSPACE (fsoc-tracker-clean Three.js scene) ---
+        # --- Tab 2: 3D AIRSPACE (Three.js scene) ---
         self.airspace_view = QWebEngineView()
         self.airspace_view.settings().setAttribute(
             QWebEngineSettings.WebGLEnabled, True
@@ -194,7 +204,10 @@ class MainWindow(QMainWindow):
         self.airspace_view.setUrl(QUrl(f"http://127.0.0.1:{port}/ui/web3d/index.html"))
         self.airspace_view.loadFinished.connect(self._on_airspace_loaded)
 
-        self.tabs.addTab(self.airspace_view, "3D AIRSPACE")
+        # Added directly: embedding it via a native window container drew the
+        # 3D page over the tab bar, hiding the 2D/3D switch.
+        self.airspace_tab = self.airspace_view
+        self.tabs.addTab(self.airspace_tab, "3D AIRSPACE")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.tabs.setCurrentIndex(1)
@@ -204,12 +217,19 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(100, self._refresh_airspace_view)
 
     def _on_tab_changed(self, index):
-        if self.tabs.widget(index) is self.airspace_view:
-            current_signature = self._web3d_asset_signature()
-            if current_signature != self._loaded_web3d_signature:
-                self.airspace_view.reload()
-            else:
-                QTimer.singleShot(100, self._refresh_airspace_view)
+        # While the 2D tab is shown, freeze the 3D page (its animation and
+        # simulation loop otherwise compete with the 2D tracker for the CPU).
+        # It resumes where it left off when its tab is shown again.
+        page = self.airspace_view.page()
+        if self.tabs.widget(index) is not self.airspace_tab:
+            page.setLifecycleState(QWebEnginePage.LifecycleState.Frozen)
+            return
+        page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
+        current_signature = self._web3d_asset_signature()
+        if current_signature != self._loaded_web3d_signature:
+            self.airspace_view.reload()
+        else:
+            QTimer.singleShot(100, self._refresh_airspace_view)
 
     @staticmethod
     def _web3d_asset_signature():
@@ -254,14 +274,20 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(target))
 
     def _refresh_airspace_view(self):
-        if self.tabs.currentWidget() is self.airspace_view:
+        if self.tabs.currentWidget() is self.airspace_tab:
             self.airspace_view.page().runJavaScript(
                 "window.fsocRefreshViewport && window.fsocRefreshViewport()"
             )
 
     def closeEvent(self, event):
-        # Dashboard is now a child widget, not a top-level window, so its own
-        # closeEvent() never fires automatically - close its logger ourselves.
+        # The dashboard is a child widget, so its own closeEvent() never fires:
+        # stop its video decoder thread before the interpreter shuts down.
+        media = getattr(self.dashboard, "media_capture", None)
+        if media is not None:
+            self.dashboard.timer.stop()
+            self.dashboard.running = False
+            media.release()
+            self.dashboard.media_capture = None
         logger = getattr(self.dashboard, "logger", None)
         if logger is not None:
             try:
@@ -274,8 +300,26 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+def _self_test(win, png_path):
+    """Smoke test for packaged builds (FSOC_SELFTEST=<png path>): run a short
+    scenario in the 2D tab, save a screenshot of the window and exit."""
+    def start():
+        win.tabs.setCurrentIndex(0)
+        win.dashboard._start_simulation()
+        QTimer.singleShot(6000, finish)
+
+    def finish():
+        screen = QApplication.primaryScreen()
+        screen.grabWindow(int(win.winId())).save(png_path)
+        win.close()
+
+    QTimer.singleShot(8000, start)
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
+    if os.environ.get("FSOC_SELFTEST"):
+        _self_test(win, os.environ["FSOC_SELFTEST"])
     sys.exit(app.exec_())
