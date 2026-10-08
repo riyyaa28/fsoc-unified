@@ -1,0 +1,47 @@
+/* Dense 2D optical-boresight workspace. */
+.camera-panel-head { padding-bottom: 9px; }
+.boresight-frame { isolation: isolate; background: #020811; }
+.boresight-frame::before { position: absolute; z-index: 1; inset: 0; content: ''; pointer-events: none; opacity: .38; background: radial-gradient(circle at 50% 50%, transparent 0 16%, rgba(2, 10, 18, .14) 45%, rgba(1, 5, 12, .66) 100%); }
+.boresight-grid { position: absolute; z-index: 1; inset: 0; display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 1fr); pointer-events: none; }
+.boresight-grid i { border-right: 1px solid rgba(111, 216, 235, .14); border-bottom: 1px solid rgba(111, 216, 235, .14); }
+.boresight-grid i:nth-child(1) { grid-column: 1; grid-row: 1; }.boresight-grid i:nth-child(2) { grid-column: 2; grid-row: 1; }.boresight-grid i:nth-child(3) { grid-column: 1; grid-row: 2; }.boresight-grid i:nth-child(4) { grid-column: 2; grid-row: 2; }
+.camera-crosshair { z-index: 3; width: 54px; height: 54px; border-color: rgba(114, 233, 247, .88); box-shadow: 0 0 0 1px rgba(2, 12, 21, .8), 0 0 23px rgba(86, 211, 239, .28); }
+.camera-crosshair::before { width: 78px; left: -13px; top: 26px; }.camera-crosshair::after { height: 78px; left: 26px; top: -13px; }
+.camera-crosshair i { position: absolute; left: 50%; top: 50%; width: 5px; height: 5px; transform: translate(-50%, -50%); border-radius: 50%; background: #c9f9ff; box-shadow: 0 0 9px #76eafa; }
+.boresight-topline, .boresight-readout, .boresight-status { position: absolute; z-index: 4; display: flex; color: #e1f8ff; text-shadow: 0 1px 3px #000; font: .56rem 'DM Mono', monospace; letter-spacing: .055em; }
+.boresight-topline { top: 10px; left: 12px; right: 12px; justify-content: space-between; color: #a9e9f6; }.boresight-readout { top: 33px; flex-direction: column; gap: 3px; line-height: 1.25; }.boresight-readout.left { left: 12px; }.boresight-readout.left strong { color: #effdff; font-size: .61rem; }.boresight-readout.left span:nth-child(2) { color: #7fe5f1; }.prediction-mode .boresight-readout.left span:nth-child(2) { color: #82cfff; }.boresight-readout.right { right: 12px; align-items: flex-end; color: #ceeaf1; }
+.boresight-status { right: 12px; bottom: 10px; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }.boresight-status span { padding: 4px 5px; border: 1px solid rgba(104, 191, 210, .48); border-radius: 3px; background: rgba(3, 15, 26, .64); }.prediction-mode .boresight-status span { border-color: rgba(105, 186, 244, .64); color: #b8e3ff; }
+.camera-marker { z-index: 5; }.camera-marker > span { position: absolute; top: -16px; left: 9px; padding: 2px 3px; border: 1px solid currentColor; border-radius: 2px; background: rgba(2, 13, 22, .72); color: inherit; font: .49rem 'DM Mono', monospace; letter-spacing: .045em; white-space: nowrap; }.camera-marker.actual { box-shadow: 0 0 10px rgba(114, 232, 247, .54); }.camera-marker.measured { width: 14px; height: 14px; border-radius: 1px; transform: translate(-50%, -50%) rotate(45deg); }.camera-marker.measured > span { transform: rotate(-45deg); transform-origin: left bottom; }.camera-marker.predicted { z-index: 6; }
+.detection-box { z-index: 4; box-shadow: 0 0 0 1px rgba(255, 159, 169, .16); }.detection-box::before { position: absolute; top: -15px; left: -1px; padding: 2px 3px; content: 'DETECTION WINDOW'; color: #ffd3d8; border: 1px solid #ff9ba7; background: rgba(28, 7, 15, .76); font: .46rem 'DM Mono', monospace; letter-spacing: .04em; white-space: nowrap; }
+.boresight-legend { justify-content: space-between; gap: 8px 13px; padding: 7px 12px 8px; }.boresight-legend .legend-note { margin-left: auto; color: #97b8c5; }.boresight-legend .legend-note.predicting { color: #8ed4ff; }
+@media (min-width: 981px) { .app-shell { padding-top: 17px; padding-bottom: 30px; }.topbar { margin-bottom: 12px; }.nav-tabs { margin-bottom: 11px; }.mission-grid.camera-mode { grid-template-columns: minmax(0, 1fr) 340px; max-width: 1360px; margin: 0 auto; align-items: start; }.mission-grid.camera-mode > .scene-panel { grid-row: span 2; min-height: 0; overflow: visible; border: 0; background: transparent; box-shadow: none; }.mission-grid.camera-mode > .status-stack { grid-column: 2; grid-row: 1; }.mission-grid.camera-mode > .control-stack { display: grid; grid-column: 2; grid-row: 2; grid-template-columns: 1fr; }.camera-mode .camera-panel { box-shadow: 0 14px 34px rgba(0, 0, 0, .22); }.camera-mode .compact-panel, .camera-mode .status-panel, .camera-mode .telemetry-panel { padding: 12px; }.camera-mode .range-row, .camera-mode .setting-row { padding: 6px 0; }.camera-mode .control-row { padding: 6px 0; }.camera-mode .camera-frame { max-height: 650px; } }
+@media (max-width: 600px) { .boresight-topline, .boresight-readout, .boresight-status { font-size: .45rem; }.boresight-readout { top: 28px; }.boresight-status { left: 8px; right: 8px; bottom: 7px; }.boresight-status span { padding: 3px; }.camera-crosshair { transform: translate(-50%, -50%) scale(.78); }.camera-marker > span, .detection-box::before { display: none; }.boresight-legend .legend-note { display: none; } }
+
+/* Mission control uses one uncluttered workspace: the active view at left and
+   click-to-open operational tables at right.  This prevents a tall stack of
+   tables from stretching the 3D/2D view and creating the former black void. */
+.mission-workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(335px, 380px); align-items: start; gap: 13px; }
+.mission-view { min-width: 0; }
+.mission-workspace .scene-panel { min-height: 0; }
+.mission-workspace .world-panel { overflow: hidden; }
+.mission-dock { position: sticky; top: 12px; overflow: hidden; border: 1px solid rgba(58, 118, 145, .62); border-radius: 10px; background: linear-gradient(145deg, rgba(13, 31, 45, .97), rgba(4, 13, 22, .98)); box-shadow: 0 18px 42px rgba(0, 0, 0, .2); }
+.dock-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 5px; gap: 4px; border-bottom: 1px solid #1d4054; background: rgba(4, 15, 25, .82); }
+.dock-tabs button { min-width: 0; padding: 8px 3px; border: 1px solid transparent; border-radius: 4px; color: #8ba5b4; background: transparent; font: 600 .54rem 'DM Mono', monospace; letter-spacing: .025em; text-transform: uppercase; white-space: nowrap; }
+.dock-tabs button:hover { color: #cceaf3; border-color: #315b70; }.dock-tabs button.selected { color: #051116; border-color: #6cd9eb; background: #6cd9eb; }
+.dock-content { max-height: min(690px, calc(100vh - 210px)); overflow: auto; padding: 10px; scrollbar-color: #32677f #081722; scrollbar-width: thin; }
+.mission-dock .status-stack, .mission-dock .control-stack { gap: 9px; }.mission-dock .status-panel, .mission-dock .telemetry-panel, .mission-dock .compact-panel { padding: 11px; }.mission-dock .panel { box-shadow: none; }.mission-dock .panel-title { margin-bottom: 8px; }.mission-dock .range-row, .mission-dock .setting-row, .mission-dock .control-row { padding: 6px 0; }.mission-dock .control-note { margin: 7px 0 0; }.mission-dock .events { min-height: 0; }.mission-dock .events .panel-head { padding: 8px 9px 7px; }.mission-dock .event-list { max-height: min(560px, calc(100vh - 300px)); padding: 0 9px 9px; }.mission-dock .scorecard { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 0; overflow: visible; }.mission-dock .score { min-width: 0; padding: 9px; }.mission-dock .score span { font-size: .54rem; }.mission-dock .score strong { font-size: .64rem; }
+.camera-mode .camera-panel { width: 100%; }.camera-mode .camera-frame { max-height: none; min-height: min(440px, calc(100vh - 210px)); background: #020811; }.camera-mode .camera-frame img { image-rendering: auto; filter: contrast(1.04) saturate(1.06); }.camera-mode .camera-scanlines { opacity: .075; }.camera-mode .boresight-frame::before { opacity: .24; }
+
+@media (max-width: 980px) { .mission-workspace { grid-template-columns: 1fr; }.mission-dock { position: static; }.dock-content { max-height: none; }.mission-dock .event-list { max-height: 420px; }.camera-mode .camera-frame { min-height: 0; } }
+@media (max-width: 600px) { .dock-tabs button { padding: 8px 1px; font-size: .48rem; }.dock-content { padding: 8px; }.mission-dock .scorecard { grid-template-columns: 1fr 1fr; } }
+
+/* Task 2: shorter, balanced 2D view. Width follows a capped height so the
+   4:3 aspect is kept and the beacon stays clearly visible. */
+.camera-panel .camera-frame { min-height: 0; max-height: none; width: min(100%, calc(min(540px, 60vh) * 4 / 3)); margin: 0 auto; }
+.camera-panel .camera-frame img { object-fit: contain; }
+.camera-marker.truth { width: 12px; height: 12px; border: 1px dashed #f2ad6a; border-radius: 50%; }
+.camera-legend.boresight-legend i.centre { border-color: #ffff00; border-radius: 0; width: 10px; height: 2px; border-width: 1px; }
+.camera-legend.boresight-legend i.frame-centre { border-color: #a0a0a0; border-radius: 0; width: 10px; height: 2px; border-width: 1px; }
+.camera-legend.boresight-legend i.measured { border-color: #50ff50; border-radius: 1px; }
+.camera-legend.boresight-legend i.predicted { width: 12px; height: 12px; border-color: #00ffff; box-shadow: none; }
+.camera-legend.boresight-legend i.candidate { border-color: #8c8c8c; border-radius: 1px; }

@@ -1,0 +1,8 @@
+dist/
+build/
+FSOC_data/
+web/node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+*.log

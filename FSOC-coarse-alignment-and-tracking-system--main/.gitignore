@@ -1,0 +1,4 @@
+dist/
+build/
+FSOC_data/
+web/node_modules/

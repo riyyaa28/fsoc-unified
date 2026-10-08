@@ -1,0 +1,9 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+numpy>=1.24
+# The server does not use desktop OpenCV windows; the headless package is
+# smaller and reliable on Linux hosts such as Render.
+opencv-python-headless>=4.8,<5.0
+reportlab>=4.2
+# Optional: pip install ultralytics to enable the YOLO setting; classical fusion remains active without it.
